@@ -328,6 +328,18 @@ def calculate_score(config: ExpConfig, pred_d: np.ndarray, sigma_d: np.ndarray,
     # 4. 综合评分（加权EI * 多样性）
     ei_weighted = np.dot(ei_per_d, config.d_weights)
     score = ei_weighted * div_weight
+
+    # 5. 硬过滤：预测值严重超出物理目标区间的recipe直接丢弃（score=0）
+    hard_out = np.zeros(n, dtype=bool)
+    for j, d_name in enumerate(config.d_names):
+        min_d = config.d_constraints[d_name]["min"]
+        max_d = config.d_constraints[d_name]["max"]
+        # 允许一点buffer，比如在区间两端各放宽 20%
+        margin = 0.2 * (max_d - min_d)
+        hard_out |= (pred_d[:, j] < (min_d - margin)) | (pred_d[:, j] > (max_d + margin))
+
+    score[hard_out] = 0.0
+
     return score
 
 
@@ -627,8 +639,10 @@ def main(run_mode: str = "toy"):
     if run_mode == "toy":
         exp_list = config.experiments  # toy模式跑所有组
     else:
-        # 实战模式：目前只对真正用于补充实测的策略跑主动选点
-        real_ids = ["I2", "I4"]  # 后续可扩展到["I2", "I4", "M1", "M2", "M3"]
+        # 实战模式：
+        #   I2 - 纯 BO + GP baseline
+        #   I4 - LHS + BO + d权重调优（推荐用来补实测的策略）
+        real_ids = ["I2", "I4"]
         exp_list = [e for e in config.experiments if e["id"] in real_ids]
 
     # 运行实验
@@ -643,5 +657,10 @@ def main(run_mode: str = "toy"):
 
 
 if __name__ == "__main__":
-    # 模式选择："toy"（消融实验，可直接运行） / "real"（实战选点，需先实现stageC_forward）
+    # 模式选择：
+    #   "toy"  - 消融实验（toy解析模型 + 映射错误注入）
+    #   "real" - 实战选点（用真实new表 + GP surrogate，当前不依赖stageC_forward）
+    # 真实补充实测时建议用 run_mode="real"
     main(run_mode="toy")
+    # 想跑实战选点时改成：
+    # main(run_mode="real")
