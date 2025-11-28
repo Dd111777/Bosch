@@ -11,7 +11,7 @@ import torch.nn as nn
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from sklearn.metrics import r2_score
-
+from sklearn.linear_model import LogisticRegression
 
 # ---- 依赖你现有工程里的模块 ----
 from physio_util import (
@@ -36,17 +36,6 @@ def ensure_dir(path: str):
 
 
 class ExpConfig:
-    """
-    StageB + StageC 多保真主动选点器的全局配置（Block A）
-
-    只负责：
-      - Excel 路径
-      - 静态参数范围/步长
-      - d1_3 / d1_5 / d1_9 的目标区间 & 权重
-      - 保存目录
-    后续 Block B/C/D/E 会在此基础上继续补充。
-    """
-
     # ========= 1. 数据路径（与 StageC 对齐） =========
     # 旧表：包含全时序 F_Flux / Ion_Flux + 全 family 形貌标签
     old_excel: str = getattr(CfgC, "old_excel", r"D:\data\pycharm\bosch\case.xlsx")
@@ -73,7 +62,7 @@ class ExpConfig:
     # [APC, source_RF, LF_RF, SF6, C4F8, DEP_time, etch_time]
     static_params: Dict[str, Dict[str, float]] = {
         "APC": {"min": 10, "max": 100, "step": 5, "unit": "mT"},
-        "source_RF": {"min": 500, "max": 3500, "step": 100, "unit": "W"},
+        "source_RF": {"min": 1000, "max": 3500, "step": 100, "unit": "W"},
         "LF_RF": {"min": 25, "max": 150, "step": 5, "unit": "W"},
         "SF6": {"min": 50, "max": 500, "step": 50, "unit": "sccm"},
         "C4F8": {"min": 50, "max": 500, "step": 50, "unit": "sccm"},
@@ -97,7 +86,7 @@ class ExpConfig:
     # ========= 5. 其他基本参数 =========
     # 候选池大小 / 每轮推荐 top-K 数量
     n_candidates: int = 2000
-    n_select: int = 10
+    n_select: int = 30
     n_rounds: int = 1  # 当前场景：一次性推荐即可
 
     # 随机种子（后续 Block 可扩展成 seeds 列表）
@@ -109,17 +98,6 @@ class ExpConfig:
 # ============================================================
 
 def load_stageB_dataset(config: ExpConfig) -> Dict[str, object]:
-    """
-    从旧表 case.xlsx 读取 StageB 训练用的数据，并抽取：
-      - 全部静态输入（标准化 & 反标准化）
-      - d1 family 在 t=3/5/9 的物理量（去掉缺失的样本）
-
-    返回一个 dict，供后续：
-      - 相关性分析（X vs d1_3/5/9）
-      - Active Subspace / 梯度敏感度（Block B）
-      - 多保真 GP 残差拟合（Block C）
-    使用。
-    """
     # 关键：一定要指定 sheet_name，否则 pd.read_excel 返回的是 dict
     sheet = getattr(Bcfg, "sheet_name", None)  # Bcfg.sheet_name 一般是 "case"
     ds, meta = excel_to_morph_dataset_from_old(
@@ -189,16 +167,6 @@ def load_stageB_dataset(config: ExpConfig) -> Dict[str, object]:
 # ============================================================
 
 def load_new_table_d1(config: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    从 Bosch 新表中读取：
-      - 静态参数 X_new: (N, 7)
-      - 实测/仿真的 d1_3 / d1_5 / d1_9: (N, 3)
-
-    逻辑与现有 stageCselection.py 中的 load_real_measurements 保持一致：
-      - 利用 load_new_excel_as_sparse_morph 做统一解析
-      - 只保留 d1_3/5/9 都存在的样本
-      - 单位与 physio_util 中的转换保持一致（nm → μm）
-    """
     recs = load_new_excel_as_sparse_morph(
         config.new_excel,
         height_family="h1",  # 与 StageB/C 形貌高度 family 保持一致
@@ -206,6 +174,7 @@ def load_new_table_d1(config: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
 
     X_list: List[np.ndarray] = []
     d_list: List[List[float]] = []
+    b_list: List[float] = []
 
     for rec in recs:
         static = rec["static"]  # shape: (7,)
@@ -223,13 +192,18 @@ def load_new_table_d1(config: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
                 d_vals.append(float(v))
         d_list.append(d_vals)
 
-    X_new = np.asarray(X_list, dtype=np.float32)  # (N, 7)
-    d_new = np.asarray(d_list, dtype=np.float32)  # (N, 3)
+        # 瓶型标签（None / 0 / 1）
+        b = rec.get("bottle_flag", None)
+        b_list.append(np.nan if b is None else float(b))
 
-    # 只保留三维 d 都不为 NaN 的样本
+    X_new = np.asarray(X_list, np.float32)
+    d_new = np.asarray(d_list, np.float32)
+    b_new = np.asarray(b_list, np.float32)
+
     mask_valid = np.isfinite(d_new).all(axis=1)
     X_new = X_new[mask_valid]
     d_new = d_new[mask_valid]
+    b_new = b_new[mask_valid]
 
     print(f"[load_new_table_d1] 加载 Bosch 新表有效样本数：{X_new.shape[0]}")
     if X_new.shape[0] == 0:
@@ -237,28 +211,13 @@ def load_new_table_d1(config: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
             f"从 {config.new_excel} 中未找到同时包含 d1_3/5/9 的有效样本，请检查新表内容。"
         )
 
-    return X_new, d_new
+    return X_new, d_new, b_new
 
 # ========================= Block B.1：StageB 模型包装 =========================
-# 封装 StageB 形貌网络，提供：
-# - 从 StageB 的 morph_best_overall.pth 加载模型与 meta
-# - 给定静态参数 X_static → 预测完整 (B,K,T) 形貌序列
-# - 只取 d1 在 t=3/5/9 的值作为低保真 “物理老师” 输出
-
-# 默认的 StageB 检查点路径（与 StageB 训练脚本保持一致）
 STAGEB_DEFAULT_CKPT = os.path.join(Bcfg.save_dir, "morph_best_overall.pth")
 
 
 class StageBOracle:
-    """
-    StageB 形貌网络封装：
-    - 从 StageB 的 best_overall ckpt 加载模型 + meta（含 norm_static, time_values 等）
-    - 内部构造一个“平均物理时序” phys_template，用于新 recipe 的快速预测
-    - 对外提供：
-        * predict_full_profile(X_static) → (B,K,T)
-        * predict_d1_3_5_9(X_static)    → (B,3)  对应 d1_(3,5,9)
-    """
-
     def __init__(
             self,
             ckpt_path: Optional[str] = None,
@@ -374,12 +333,6 @@ class StageBOracle:
     # 内部：构造“平均物理时序”模板 + 保存旧表数据
     # ------------------------------------------------------------------
     def _build_phys_template(self):
-        """
-        从 StageB 训练用的旧表中：
-        - 取出 phys_seq (N,2,T)，在 N 维度做均值 → (1,2,T)，作为 phys_template
-        - 取出一行 tvals_mat (T,) 作为时间刻度模板
-        这样对新 recipe，只需替换静态参数，物理时序用一个“典型 profile” 近似。
-        """
         ds, meta = excel_to_morph_dataset_from_old(
             self.old_excel_path, sheet_name=getattr(Bcfg, "sheet_name", None)
         )
@@ -402,14 +355,6 @@ class StageBOracle:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def predict_full_profile(self, X_static: np.ndarray) -> np.ndarray:
-        """
-        输入：
-          X_static: (B,7) numpy，列顺序需与 excel_to_morph_dataset_from_old 的 static_keys 对齐：
-            [APC, source_RF, LF_RF, SF6, C4F8, DEP_time, etch_time]
-
-        输出：
-          y_pred: (B,K,T) numpy，对应 families=self.family_names，时间轴与 TIME_LIST 对齐
-        """
         if self.model is None:
             raise RuntimeError("StageB 模型尚未加载。")
 
@@ -441,14 +386,6 @@ class StageBOracle:
         X_static: np.ndarray,
         time_ids: Tuple[str, ...] = ("3", "5", "9"),
     ) -> np.ndarray:
-        """
-        输入：
-          X_static: (B,7) numpy
-          time_ids: 要抽取的时间刻度标签，默认 ("3","5","9")
-
-        输出：
-          d_vals: (B, len(time_ids)) numpy，对应 d1_time_ids
-        """
         full = self.predict_full_profile(X_static)  # (B,K,T)
 
         # 将 time_ids 转成索引；如果某个时间不在 T2IDX 中则跳过
@@ -463,17 +400,6 @@ class StageBOracle:
 # ========================= Block B.2：StageB 敏感度 & Active Subspace =========================
 
 def compute_stageB_correlations(stageB_data: dict, cfg: "ExpConfig") -> dict:
-    """
-    经典相关性分析（基于旧表 StageB 数据）：
-      - 输入：
-          stageB_data: load_stageB_dataset(cfg) 的返回
-          cfg        : ExpConfig，全局配置（主要用 static_names / d_names）
-      - 输出：
-          {
-            "pearson":  pd.DataFrame (index=static_names, columns=d_names),
-            "spearman": Optional[pd.DataFrame]  # 若缺少 scipy 则为 None
-          }
-    """
     X = np.asarray(stageB_data["X_d1_raw"], dtype=np.float64)   # (N, D)
     Y = np.asarray(stageB_data["Y_d1_phys"], dtype=np.float64)  # (N, 3)
 
@@ -533,7 +459,7 @@ def estimate_active_subspace_from_stageB(
     """
     基于 StageB 模型的 Active Subspace 估计：
       - 利用旧表 (static_norm, phys_seq, time_mat)，抽样 n_samples 个 recipe
-      - 用 autograd 计算 d1_{target_time} 对静态输入（归一化空间）的梯度
+            - 用 autograd 计算 标量目标 J(x) 对静态输入（归一化空间）的梯度
       - 聚合得到 C = 1/M Σ g_i g_i^T，并做特征分解
       - 输出：
           {
@@ -573,6 +499,16 @@ def estimate_active_subspace_from_stageB(
     model = oracle.model
     device = oracle.device
 
+    # J(x) = Σ_j w_j * (d1_j(x) - center_j)^2 的参数（3/5/9 三个时刻）
+    centers = torch.tensor(
+        [cfg.d_constraints[name]["center"] for name in cfg.d_names],
+        dtype=torch.float32,
+        device=device,
+    )  # (3,)
+    w = torch.tensor(cfg.d_weights, dtype=torch.float32, device=device)
+    w = w / (w.sum() + 1e-12)
+    tidx_list = [T2IDX[t] for t in ["3", "5", "9"]]
+
     grads_list = []
 
     # 按 batch 求梯度
@@ -588,13 +524,20 @@ def estimate_active_subspace_from_stageB(
 
         x_norm = x_norm.detach().clone().requires_grad_(True)
 
-        y = model(x_norm, phys, tvals)                   # (B,K,T)
-        # d1 family 的 index
+        y = model(x_norm, phys, tvals)  # (B,K,T)
         idx_d1 = oracle.idx_d1
-        y_d1_t = y[:, idx_d1, tidx]                      # (B,)
+
+        # 取 d1 family 在 3/5/9 三个时刻的输出，按目标 J 聚合
+        d_list = []
+        for tid in tidx_list:
+            d_list.append(y[:, idx_d1, tid])  # 每个是 (B,)
+        d_vals = torch.stack(d_list, dim=1)  # (B,3)
+
+        diff = d_vals - centers[None, :]  # (B,3)
+        J_batch = torch.sum(w[None, :] * diff ** 2, dim=1)  # (B,)
 
         # 对所有样本求平均再回传，数值更稳定
-        val = y_d1_t.mean()
+        val = J_batch.mean()
         val.backward()
 
         g = x_norm.grad.detach().cpu().numpy()           # (B,D)
@@ -643,20 +586,6 @@ def estimate_active_subspace_from_stageB(
     return result
 # ========================= Block C：多保真 Residual GP 代理 =========================
 class MultiFidelityResidualGP:
-    """
-    多保真 surrogate 封装：
-      - 低保真：StageBOracle.predict_d1_3_5_9(X)  → y_sim(X)
-      - 高保真：新表实测 d_new(X)                → y_real(X)
-      - 残差： r(X) = y_real(X) - y_sim(X)
-      - 对 r_j(X) 训练 3 个独立的 Gaussian Process：
-            r_j ~ GP_j(X)
-
-    对外接口：
-      - predict(X) → μ_real(X) = y_sim(X) + μ_r(X)
-      - predict_with_uncertainty(X) → (μ_real(X), σ_real(X))
-      - diagnostics: StageB & 多保真 surrogate 的 R² 对比
-    """
-
     def __init__(
         self,
         cfg: "ExpConfig",
@@ -666,15 +595,6 @@ class MultiFidelityResidualGP:
         jitter: float = 1e-6,
         n_restarts_optimizer: int = 5,
     ):
-        """
-        参数：
-          cfg                 : 全局配置（只用到 d_names）
-          oracle              : StageBOracle 实例，用于计算 y_sim
-          X_train             : (N,7) 新表静态参数
-          y_real_train        : (N,3) 新表实测 d1_3/5/9
-          jitter              : GP 中的 alpha，数值稳定用
-          n_restarts_optimizer: GP 超参数优化的重启次数
-        """
         self.cfg = cfg
         self.oracle = oracle
 
@@ -686,7 +606,15 @@ class MultiFidelityResidualGP:
         self.y_real_train = Y_real
         self.input_dim = X.shape[1]
         self.output_dim = Y_real.shape[1]  # 3，对应 d1_3/5/9
-
+        # d1 输出的物理上下界（用于后处理裁剪）
+        self.y_min = np.array(
+            [cfg.d_constraints[name]["min"] for name in cfg.d_names],
+            dtype=np.float64,
+        )[None, :]  # (1,3)
+        self.y_max = np.array(
+            [cfg.d_constraints[name]["max"] for name in cfg.d_names],
+            dtype=np.float64,
+        )[None, :]  # (1,3)
         # 特征标准化（防止 GP length_scale 优化异常）
         self.x_mean = self.X_train_raw.mean(axis=0, keepdims=True)  # (1,D)
         self.x_std = self.X_train_raw.std(axis=0, keepdims=True)    # (1,D)
@@ -759,13 +687,6 @@ class MultiFidelityResidualGP:
     # 对外接口：只要多保真均值预测
     # ------------------------------------------------------------------
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        输入：
-          X: (N,D) 或 (D,) numpy，静态参数（原始尺度）
-
-        输出：
-          μ_real: (N,3) numpy，预测的 d1_3/5/9 多保真均值
-        """
         X_raw = np.asarray(X, dtype=np.float64)
         if X_raw.ndim == 1:
             X_raw = X_raw[None, :]
@@ -788,6 +709,8 @@ class MultiFidelityResidualGP:
 
         # 多保真均值 = 低保真 + 残差均值
         mu_real = y_sim + mu_r
+        # 物理裁剪：d1 不可能为负或超过约束上限
+        mu_real = np.clip(mu_real, self.y_min, self.y_max)
         return mu_real
 
     # ------------------------------------------------------------------
@@ -822,10 +745,65 @@ class MultiFidelityResidualGP:
             std_r[:, j] = s
 
         mu_real = y_sim + mu_r
+        # 物理裁剪：d1 不可能为负或超过约束上限
+        mu_real = np.clip(mu_real, self.y_min, self.y_max)
         sigma_real = std_r  # 不确定度完全来自残差 GP 部分
 
         return mu_real, sigma_real
 
+
+class BottlePenaltyModel:
+    """用静态参数预测瓶型概率的简单模型"""
+    def __init__(self, clf, x_mean, x_std):
+        self.clf = clf
+        self.x_mean = x_mean
+        self.x_std = x_std
+
+    def _transform(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        return (X - self.x_mean) / (self.x_std + 1e-8)
+
+    def predict_prob(self, X):
+        Xn = self._transform(X)
+        p = self.clf.predict_proba(Xn)[:, 1]
+        return np.clip(p, 0.0, 1.0)
+
+
+def build_bottle_penalty_model(cfg: "ExpConfig",
+                               X_new: np.ndarray,
+                               bottle_flag: np.ndarray) -> Optional["BottlePenaltyModel"]:
+    b = np.asarray(bottle_flag, dtype=np.float64)
+    mask = np.isfinite(b)
+    X_train = X_new[mask]
+    y_train = (b[mask] > 0.5).astype(int)  # 1=瓶型, 0=正常
+
+    if X_train.shape[0] < 5 or len(np.unique(y_train)) < 2:
+        print("[build_bottle_penalty_model] 有效样本太少或标签单一，暂不启用瓶型惩罚。")
+        return None
+
+    x_mean = X_train.mean(axis=0)
+    x_std = X_train.std(axis=0)
+    x_std[x_std < 1e-6] = 1.0
+
+    Xn = (X_train - x_mean) / x_std
+    clf = LogisticRegression(
+        penalty="l2",
+        C=1.0,
+        solver="lbfgs",
+        max_iter=1000,
+        class_weight="balanced",
+        random_state=cfg.seed,
+    )
+    clf.fit(Xn, y_train)
+
+    model = BottlePenaltyModel(clf, x_mean, x_std)
+
+    p_train = model.predict_prob(X_train)
+    print("[build_bottle_penalty_model] 瓶型惩罚模型训练完成。")
+    print(f"  训练样本数: {X_train.shape[0]}，阳性比例: {y_train.mean():.3f}")
+    print(f"  瓶型样本平均 p: {p_train[y_train==1].mean():.3f}, 非瓶型平均 p: {p_train[y_train==0].mean():.3f}")
+
+    return model
 
 def build_multi_fidelity_surrogate(
     cfg: "ExpConfig",
@@ -835,18 +813,6 @@ def build_multi_fidelity_surrogate(
     jitter: float = 1e-6,
     n_restarts_optimizer: int = 5,
 ) -> MultiFidelityResidualGP:
-    """
-    工具函数：给定配置 + StageBOracle + 新表数据，一步构建多保真 surrogate。
-
-    输入：
-      cfg       : ExpConfig
-      oracle    : StageBOracle
-      X_new     : (N,7) 新表静态参数
-      d_new     : (N,3) 新表实测 d1_3/5/9
-
-    输出：
-      surrogate : MultiFidelityResidualGP 实例
-    """
     print("[build_multi_fidelity_surrogate] 使用新表数据训练 Residual GP...")
     surrogate = MultiFidelityResidualGP(
         cfg=cfg,
@@ -860,17 +826,6 @@ def build_multi_fidelity_surrogate(
     return surrogate
 # ========================= Block D：候选生成（StageB + Active Subspace） =========================
 def clip_and_quantize_static(cfg: "ExpConfig", X_raw: np.ndarray) -> np.ndarray:
-    """
-    按 cfg.static_params 中的 min/max/step 对静态参数：
-      - 逐参数裁剪到 [min, max]
-      - 按 step 做量化：v = min + round((v-min)/step)*step
-
-    输入：
-      X_raw: (N,D) 或 (D,) numpy
-
-    输出：
-      X_q: (N,D) numpy
-    """
     X = np.asarray(X_raw, dtype=np.float64)
     if X.ndim == 1:
         X = X[None, :]
@@ -893,21 +848,20 @@ def clip_and_quantize_static(cfg: "ExpConfig", X_raw: np.ndarray) -> np.ndarray:
         # 再做一次裁剪，避免 rounding 超界
         v = np.clip(v, p["min"], p["max"])
         X_q[:, j] = v
-
+    # ---- 额外跨参数约束：SF6 >= C4F8 - 150 ----
+    names = list(cfg.static_names)
+    if "SF6" in names and "C4F8" in names:
+        idx_sf6 = names.index("SF6")
+        idx_c4f8 = names.index("C4F8")
+        sf6 = X_q[:, idx_sf6]
+        c4f8 = X_q[:, idx_c4f8]
+        lower = c4f8 - 150.0
+        sf6_new = np.maximum(sf6, lower)
+        X_q[:, idx_sf6] = sf6_new
     return X_q
 
 
 def sample_random_static(cfg: "ExpConfig", n: int) -> np.ndarray:
-    """
-    在静态参数范围内做均匀随机采样，并按 step 量化。
-
-    输入：
-      cfg : ExpConfig
-      n   : 采样数量
-
-    输出：
-      X: (n,D) numpy
-    """
     D = len(cfg.static_names)
     X = np.zeros((n, D), dtype=np.float64)
 
@@ -984,35 +938,6 @@ def refine_candidates_with_stageB(
     lr: float = 0.5,
     subspace_dim: int = 1,
 ) -> np.ndarray:
-    """
-    对若干“有希望”的候选 recipe，用 StageB + Active Subspace 做几步梯度下降：
-
-      目标函数：
-        J(x) = Σ_j w_j * (d1_j(x) - center_j)^2
-
-      梯度空间：
-        - 在 StageB 的静态归一化空间 x_norm 上做梯度
-        - 若提供 as_info（Block B.2 输出），可以把梯度投影到前 subspace_dim 个
-          Active Subspace 方向上，避免在不重要方向乱抖
-
-      每一步更新后：
-        - 映射回原始尺度 x_raw
-        - 裁剪 + step 量化（clip_and_quantize_static）
-        - 作为下一步的起点
-
-    输入：
-      cfg         : ExpConfig
-      oracle      : StageBOracle
-      X_init      : (N,D) numpy，初始候选（已在范围内）
-      as_info     : Active Subspace 信息 dict（可选）
-      n_steps     : 梯度迭代步数
-      lr          : 学习率（在归一化空间）
-      subspace_dim: Active Subspace 维度（0 表示不用 AS，直接用原始梯度）
-
-    输出：
-      X_refined: (N,D) numpy，微调后的候选
-    """
-
     X0 = np.asarray(X_init, dtype=np.float64)
     if X0.ndim == 1:
         X0 = X0[None, :]
@@ -1107,35 +1032,6 @@ def generate_candidates_with_stageB(
     subspace_dim: int = 1,
     n_refine_max: int = 512,
 ) -> Dict[str, np.ndarray]:
-    """
-    综合候选生成流程（Block D 主函数）：
-
-      1. 基础随机采样：
-         - 按 static_params 范围随机采样 N0 = oversample_factor * cfg.n_candidates
-         - 裁剪 + step 量化
-
-      2. StageB 快速筛选：
-         - 调 StageBOracle 预测 d1_3/5/9
-         - 计算 StageB 目标损失 J_sim
-         - 选取损失最小的前 N_keep = max(cfg.n_candidates, stageB_keep_ratio * N0)
-
-      3. 梯度微调（小号 MFL）：
-         - 对前 n_refine_max 个“最好”的点做 n_grad_steps 步梯度下降
-           （在归一化空间，必要时用 Active Subspace 限制方向）
-
-      4. 合并：
-         - 把微调后的点 + 剩余未微调的点合并成最终候选池 X_candidates
-
-    输出的 dict：
-      {
-        "X_candidates":      (M,D)  用于后续 Block E 的多保真 EI 打分
-        "X_stageB_all":      (N0,D) 初始所有候选
-        "J_stageB_all":      (N0,)  对应的 StageB 损失
-        "X_stageB_top":      (N_keep,D) 筛选后保留的候选（微调前）
-        "J_stageB_top":      (N_keep,)  对应损失
-        "d_stageB_top":      (N_keep,3) StageB 眼中的 d1_3/5/9 预测
-      }
-    """
     # ---------- 1. 基础随机采样 ----------
     N0 = int(cfg.n_candidates * oversample_factor)
     print(f"[generate_candidates_with_stageB] 基础采样 N0={N0} ...")
@@ -1224,25 +1120,6 @@ def scalar_objective_from_mu_sigma(
     mu_real: np.ndarray,
     sigma_real: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    根据多保真 surrogate 的 μ_real, σ_real 近似构造标量损失 J 的均值和标准差。
-
-    设：
-        Y_j ~ N(μ_j, σ_j^2)  对应 d1_3/5/9
-        J(Y) = Σ_j w_j * (Y_j - center_j)^2
-
-    我们用一阶近似（delta method）估计 J 的方差：
-        grad_J_j = ∂J/∂Y_j ≈ 2 * w_j * (μ_j - center_j)
-        Var[J] ≈ Σ_j (grad_J_j)^2 * σ_j^2
-
-    输入：
-      mu_real:   (N,3) surrogate 均值
-      sigma_real:(N,3) surrogate 标准差
-
-    输出：
-      J_mu:   (N,)  标量目标的期望
-      J_sigma:(N,)  标量目标的近似标准差（>=0）
-    """
     mu_real = np.asarray(mu_real, dtype=np.float64)
     sigma_real = np.asarray(sigma_real, dtype=np.float64)
     assert mu_real.shape == sigma_real.shape
@@ -1272,25 +1149,6 @@ def expected_improvement_for_minimization(
     J_sigma: np.ndarray,
     J_best: float,
 ) -> np.ndarray:
-    """
-    对最小化问题的期望改进 EI：
-
-        I(x) = max(J_best - J(x), 0)
-        若 J ~ N(J_mu, J_sigma^2)，则
-
-        Z = (J_best - J_mu) / J_sigma
-        EI(x) = (J_best - J_mu) * Φ(Z) + J_sigma * φ(Z)
-
-      若 J_sigma ≈ 0，则退化为 EI = max(J_best - J_mu, 0)。
-
-    输入：
-      J_mu   : (N,)
-      J_sigma: (N,)
-      J_best : 标量，目前已有高保真数据上的最优 J 值
-
-    输出：
-      EI: (N,)
-    """
     J_mu = np.asarray(J_mu, dtype=np.float64)
     J_sigma = np.asarray(J_sigma, dtype=np.float64)
     assert J_mu.shape == J_sigma.shape
@@ -1380,64 +1238,48 @@ def compute_stageB_prior_weight(
 
 
 def score_candidates_with_EI_and_prior(
-    cfg: "ExpConfig",
-    surrogate: "MultiFidelityResidualGP",
-    X_candidates: np.ndarray,
-    stageB_data: Optional[dict] = None,
-    J_best: Optional[float] = None,
-    prior_length_scale: float = 1.0,
-    prior_floor: float = 0.1,
-) -> dict:
-    """
-    对候选集 X_candidates 使用：
-      - 多保真 surrogate 的 EI（最小化 J）
-      - StageB 分布先验
-    综合打分：
-
-        score(x) = EI(x) * prior(x)
-
-    输入：
-      cfg            : ExpConfig
-      surrogate      : MultiFidelityResidualGP
-      X_candidates   : (N,D) numpy
-      stageB_data    : StageB 数据（若为 None，则不加先验）
-      J_best         : 当前已知的最佳 J（可为 None）
-                       若为 None，则用 surrogate.y_real_train 上的最小 J 作为 J_best
-      prior_length_scale: StageB 先验的距离尺度 L
-      prior_floor    : 先验下限（避免 0）
-
-    输出：
-      info dict，包含：
-        - X_candidates
-        - mu_real       (N,3)
-        - sigma_real    (N,3)
-        - J_mu          (N,)
-        - J_sigma       (N,)
-        - EI            (N,)
-        - prior         (N,)  StageB 先验
-        - score         (N,)  最终分数
-        - J_best        标量
-    """
+        cfg: "ExpConfig",
+        surrogate: "MultiFidelityResidualGP",
+        X_candidates: np.ndarray,
+        stageB_data: Optional[dict],
+        J_best: Optional[float] = None,
+        prior_length_scale: float = 1.0,
+        prior_floor: float = 0.1,
+        bottle_model: Optional["BottlePenaltyModel"] = None,
+        bottle_penalty_weight: float = 1.0,
+    ) -> dict:
     X_cand = np.asarray(X_candidates, dtype=np.float64)
     if X_cand.ndim == 1:
         X_cand = X_cand[None, :]
 
-    # 1) surrogate 的均值与不确定度
-    mu_real, sigma_real = surrogate.predict_with_uncertainty(X_cand)  # (N,3), (N,3)
+    mu_real, sigma_real = surrogate.predict_with_uncertainty(X_cand)
+    J_mu_raw, J_sigma = scalar_objective_from_mu_sigma(cfg, mu_real, sigma_real)
+    J_mu = J_mu_raw.copy()
+    # 先算一遍训练集的原始 J
+    J_train_raw = stageB_objective_from_preds(cfg, surrogate.y_real_train)
 
-    # 2) 将多维输出映射到标量目标 J
-    J_mu, J_sigma = scalar_objective_from_mu_sigma(cfg, mu_real, sigma_real)
+    bottle_prob_cand = np.zeros_like(J_mu_raw)
+    if bottle_model is not None and bottle_penalty_weight > 0:
+        # 用训练集的典型尺度做缩放
+        J_ref = float(max(np.median(J_train_raw), 1e-6))
 
+        # 候选点的瓶型概率 & 惩罚
+        bottle_prob_cand = bottle_model.predict_prob(X_cand)
+        penalty_cand = bottle_penalty_weight * J_ref * bottle_prob_cand
+        J_mu = J_mu + penalty_cand
+
+        # 训练点上的惩罚，用来定义 J_best
+        bottle_prob_train = bottle_model.predict_prob(surrogate.X_train_raw)
+        penalty_train = bottle_penalty_weight * J_ref * bottle_prob_train
+        J_train_eff = J_train_raw + penalty_train
+    else:
+        J_train_eff = J_train_raw
     # 3) 当前已知最佳 J_best（来自高保真数据）
     if J_best is None:
-        # 用 surrogate 训练集的 y_real_train 计算
-        J_train = stageB_objective_from_preds(cfg, surrogate.y_real_train)  # (N_train,)
-        J_best = float(J_train.min())
-        print(f"[score_candidates_with_EI_and_prior] 自动推得 J_best = {J_best:.3e}")
+        J_best = float(J_train_eff.min())
+        print(f"[score_candidates_with_EI_and_prior] 自动推得 J_best(含瓶型惩罚) = {J_best:.3e}")
 
-    # 4) 计算 minimization EI
     EI = expected_improvement_for_minimization(J_mu, J_sigma, J_best)
-
     # 5) StageB 分布先验
     if stageB_data is not None:
         prior = compute_stageB_prior_weight(
@@ -1455,7 +1297,9 @@ def score_candidates_with_EI_and_prior(
         "X_candidates": X_cand,
         "mu_real": mu_real,
         "sigma_real": sigma_real,
-        "J_mu": J_mu,
+        "J_mu": J_mu,  # 已含惩罚
+        "J_mu_raw": J_mu_raw,  # 原始 d1 目标
+        "bottle_prob": bottle_prob_cand,  # 候选点瓶型概率
         "J_sigma": J_sigma,
         "EI": EI,
         "prior": prior,
@@ -1492,14 +1336,26 @@ def select_topK_recipes(
     """
     X_cand = score_info["X_candidates"]
     score = score_info["score"]
-
+    J_mu = np.asarray(score_info["J_mu"], dtype=np.float64)
     N = X_cand.shape[0]
+    ...
     if topK is None:
         topK = cfg.n_select
     topK = min(topK, N)
 
-    order = np.argsort(score)[::-1]  # score 越大越好
+    # 先按 J_mu 从小到大排序，再用 score 做 tie-break（score 大者优先）
+    # 这样保证推荐点是“预测损失尽量小”的，同时兼顾 EI / 先验信息。
+    order = np.lexsort((-score, J_mu))
     idx_sel = order[:topK]
+
+    # 如果最好的候选 J_mu 仍明显大于当前已知 J_best，给出一个提示
+    J_best = float(score_info["J_best"])
+    J_mu_best_cand = float(J_mu[idx_sel[0]])
+    if J_mu_best_cand > 1.5 * J_best:
+        print(
+            "[select_topK_recipes] 警告：候选集中最小的 J_mu 仍明显大于当前已知 J_best，"
+            "本轮推荐点主要用于探索而非显著优于现有最优 recipe。"
+        )
 
     result = {
         "X_selected": X_cand[idx_sel],
@@ -1715,17 +1571,6 @@ def save_results_advanced(
 
 
 def run_advanced_selection(cfg: "ExpConfig") -> dict:
-    """
-    一键跑完：
-      - Block A: 数据入口
-      - Block B.1: StageBOracle 模型
-      - Block B.2: StageB 相关性 + Active Subspace
-      - Block C: 多保真 Residual GP surrogate
-      - Block D: 候选生成（StageB + 梯度微调）
-      - Block E: 多保真 EI + StageB 先验打分
-      - Block F: 结果导出
-    返回一个 dict，把中间关键对象都回传出来方便你 debug / 画图。
-    """
     np.random.seed(cfg.seed)
     # 如需结果完全可复现，可以同步设置 torch 随机种子
     try:
@@ -1737,7 +1582,7 @@ def run_advanced_selection(cfg: "ExpConfig") -> dict:
 
     print("\n========== Block A：加载数据 ==========")
     stageB_data = load_stageB_dataset(cfg)
-    X_new, d_new = load_new_table_d1(cfg)
+    X_new, d_new, bottle_flag = load_new_table_d1(cfg)
 
     print("\n========== Block B.1：加载 StageB 模型 ==========")
     oracle = StageBOracle(
@@ -1758,31 +1603,33 @@ def run_advanced_selection(cfg: "ExpConfig") -> dict:
     print("\n========== Block C：构建多保真 Residual GP ==========")
     surrogate = build_multi_fidelity_surrogate(cfg, oracle, X_new, d_new)
 
-    print("\n========== Block D：生成候选（StageB + 梯度微调） ==========")
+    print("\n========== Block C+：瓶型惩罚模型 ==========")
+    bottle_model = build_bottle_penalty_model(cfg, X_new, bottle_flag)
+
+    print("\n========== Block D：生成候选点 ==========")
     cand_info = generate_candidates_with_stageB(
         cfg=cfg,
         oracle=oracle,
         as_info=as_info,
         oversample_factor=2.0,
         stageB_keep_ratio=0.5,
-        n_grad_steps=3,
+        n_grad_steps=cfg.stageB_grad_steps,
         grad_lr=0.5,
         subspace_dim=1,
-        n_refine_max=512,
     )
-
-    print("\n========== Block E：多保真 EI + StageB 先验打分 ==========")
+    print("\n========== Block E：多保真打分 + 先验 + 瓶型惩罚 ==========")
     score_info = score_candidates_with_EI_and_prior(
         cfg=cfg,
         surrogate=surrogate,
         X_candidates=cand_info["X_candidates"],
         stageB_data=stageB_data,
-        J_best=None,                # 自动根据新表最优 J 估计
+        J_best=None,
         prior_length_scale=1.0,
         prior_floor=0.1,
+        bottle_model=bottle_model,
+        bottle_penalty_weight=cfg.bottle_penalty_weight,
     )
     selected = select_topK_recipes(cfg, score_info, topK=cfg.n_select)
-
     print("\n========== Block F：保存结果 ==========")
     save_results_advanced(
         cfg=cfg,

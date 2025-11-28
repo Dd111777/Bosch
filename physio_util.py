@@ -332,7 +332,21 @@ def load_new_excel_as_sparse_morph(new_excel: str, height_family="h1") -> List[D
                 v = float(df.iloc[i][col_like(cname)])*nm2um
                 tg[(fam,tid)] = v
             except Exception: pass
-        recs.append({"static": static[i], "targets": tg})
+        bottle_flag = None
+        try:
+            bottle_col = col_like("瓶型")      # 按你实际列名改
+            v = df.iloc[i][bottle_col]
+            bottle_flag = int(v)              # 0/1 或者别的
+        except Exception:
+            bottle_flag = None                # 没有这一列或解析失败，就当没有
+
+        recs.append({
+            "static": static[i],
+            "targets": tg,
+            "bottle_flag": bottle_flag,       # 新增字段
+        })
+
+
     return recs
 
 
