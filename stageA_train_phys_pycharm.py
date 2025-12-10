@@ -269,27 +269,8 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
     }
     return y_cal_t, dbg
 
-
-# -------------------- Ion 工具函数 --------------------
-def ion_weight(tgt_ch, mask_ch, gamma=4.0, cap=50.0, base_q=0.75):
-    """
-    针对 Ion 的高值样本加权：值越大，权重越高（上限 cap）。
-    """
-    if mask_ch.dim() == 3 and mask_ch.size(1) != 1:
-        mask_ch = mask_ch[:, 1:2, :]
-    with torch.no_grad():
-        pos = torch.clamp(tgt_ch, min=0)
-        if mask_ch.any():
-            pq = torch.quantile(pos[mask_ch.bool()], base_q)
-        else:
-            pq = torch.tensor(1.0, device=tgt_ch.device)
-        w_mag = torch.clamp((pos / (pq + 1e-9)) ** gamma, max=cap)
-    return w_mag * mask_ch.float()
-
-
 def to_log_domain(x, c):      # x>0,  c>0
     return torch.log(torch.clamp(x, min=1e-12) + c)
-
 
 # -------------------- 学习率调度：Warmup + Cosine --------------------
 def make_warmup_cosine(optimizer, total_epochs, warmup_epochs, base_lr, use_cosine=True):
@@ -314,10 +295,12 @@ def hetero_gaussian_nll(mu, logvar, y_true, mask):
     nll = 0.5 * ((mu - y_true) ** 2 * inv_var + logvar)
     nll = (nll * mask).sum() / mask.sum().clamp_min(1e-6)
     return nll
-
-
-# -------------------- 训练单通道 --------------------
 def train_single_channel(channel_idx, dataset, meta):
+    """
+    F_Flux: 保持原来的 L1 + TV 配置。
+    Ion_Flux: 去掉原来的 mu/logvar + 异方差 NLL，
+              在物理域上用 L1 + 高值样本加权。
+    """
     is_F = (channel_idx == 0)
     ch_name = FAMILIES[channel_idx]
     out_dir = os.path.join(Cfg.save_dir, ch_name)
@@ -335,66 +318,51 @@ def train_single_channel(channel_idx, dataset, meta):
     va = DataLoader(va_set, batch_size=Cfg.batch, shuffle=False)
     T = int(meta["T"])
 
-    # ===== 模型（Ion 可用独立的更大容量；未在 Cfg 里定义则回退到通用值）=====
+    # ===== 模型（Ion 可以单独用更大容量）=====
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_F:
         model = PhysicsSeqPredictor(
-            d_model=Cfg.d_model, nhead=Cfg.nhead, num_layers=Cfg.num_layers,
-            dim_ff=Cfg.dim_ff, dropout=Cfg.dropout, T=T
+            d_model=Cfg.d_model,
+            nhead=Cfg.nhead,
+            num_layers=Cfg.num_layers,
+            dim_ff=Cfg.dim_ff,
+            dropout=Cfg.dropout,
+            T=T,
         ).to(dev)
-        ion_arch = None
     else:
-        d_model = getattr(Cfg, "ion_d_model", 192)
-        nhead = getattr(Cfg, "ion_nhead", 8)
+        d_model  = getattr(Cfg, "ion_d_model", 192)
+        nhead    = getattr(Cfg, "ion_nhead",   8)
         n_layers = getattr(Cfg, "ion_num_layers", 6)
-        dim_ff = getattr(Cfg, "ion_dim_ff", 384)
-        dropout = getattr(Cfg, "ion_dropout", 0.1)
+        dim_ff   = getattr(Cfg, "ion_dim_ff",  384)
+        dropout  = getattr(Cfg, "ion_dropout", 0.1)
         model = PhysicsSeqPredictor(
-            d_model=d_model, nhead=nhead, num_layers=n_layers,
-            dim_ff=dim_ff, dropout=dropout, T=T
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=n_layers,
+            dim_ff=dim_ff,
+            dropout=dropout,
+            T=T,
         ).to(dev)
-        ion_arch = {
-            "d_model": d_model,
-            "nhead": nhead,
-            "num_layers": n_layers,
-            "dim_ff": dim_ff,
-            "dropout": dropout,
-        }
 
     # ===== 损失/TV/F 配置 =====
     if is_F:
         base_loss = _make_loss(Cfg.f_loss)
-        eps_mask = Cfg.eps_mask_F
+        eps_mask  = Cfg.eps_mask_F
         use_tv_reg = Cfg.use_tv_reg_F
-        tv_lambda = Cfg.tv_lambda_F
+        tv_lambda  = Cfg.tv_lambda_F
     else:
-        eps_mask = Cfg.eps_mask_I  # 这里只参与 mask_ch 的构造
+        eps_mask  = Cfg.eps_mask_I
         use_tv_reg = False
-        tv_lambda = 0.0
-
-    # ======= Ion: 估计 log 平移常数 c =======
-    ion_c = Cfg.ion_c_min
-    if not is_F:
-        with torch.no_grad():
-            vals = []
-            for _, phys_tgt, pmask, _ in tr:
-                x = phys_tgt[:, 1:2, :]
-                m = (pmask[:, 1:2, :] & (x > 0))
-                if m.any():
-                    vals.append(x[m].float())
-                if len(vals) > 8:
-                    break
-            if len(vals):
-                allv = torch.cat(vals)
-                ion_c = float(torch.quantile(allv, Cfg.ion_c_quantile).item())
-            ion_c = max(ion_c, Cfg.ion_c_min)
+        tv_lambda  = 0.0
 
     # ======= 优化器/调度 =======
-    params = list(model.parameters())
     opt_lr = Cfg.lr if is_F else getattr(Cfg, "ion_lr", 5e-4)
-    wd = Cfg.weight_decay if is_F else getattr(Cfg, "ion_weight_decay", 1e-4)
-    opt = torch.optim.AdamW(params, lr=opt_lr, weight_decay=wd)
-    sch = make_warmup_cosine(opt, Cfg.max_epochs, Cfg.warmup_epochs, opt_lr, use_cosine=Cfg.use_cosine)
+    wd     = Cfg.weight_decay if is_F else getattr(Cfg, "ion_weight_decay", 1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=opt_lr, weight_decay=wd)
+    sch = make_warmup_cosine(
+        opt, Cfg.max_epochs, Cfg.warmup_epochs, opt_lr,
+        use_cosine=Cfg.use_cosine,
+    )
 
     tr_hist, va_hist = [], []
     best = 1e9
@@ -406,6 +374,11 @@ def train_single_channel(channel_idx, dataset, meta):
         model.train()
         s = 0.0
         n = 0
+
+        # Ion：γ 固定一个值（可以在 Cfg 里加 ion_weight_gamma_target 调）
+        if not is_F:
+            gamma_cur = getattr(Cfg, "ion_weight_gamma_target", 4.0)
+            cap_cur   = getattr(Cfg, "ion_weight_cap", 50.0)
 
         for s8, phys_tgt, pmask, tvals in tr:
             s8 = s8.to(dev)
@@ -419,15 +392,19 @@ def train_single_channel(channel_idx, dataset, meta):
                     s8=s8.cpu().numpy(),
                     tgt=phys_tgt.cpu().numpy(),
                     mask=pmask.cpu().numpy(),
-                    t=tvals.cpu().numpy()
+                    t=tvals.cpu().numpy(),
                 )
                 saved_batch = True
 
             pred = model(s8, tvals)  # (B,2,T)
             pred_ch_raw = pred[:, channel_idx:channel_idx + 1, :]
             tgt_ch = phys_tgt[:, channel_idx:channel_idx + 1, :]
-            mask_ch = (pmask[:, channel_idx:channel_idx + 1, :] &
-                       (tgt_ch.abs() >= eps_mask))
+
+            # 用 eps_mask 把极小值 / 无效点过滤掉
+            mask_ch = (
+                pmask[:, channel_idx:channel_idx + 1, :]
+                & (tgt_ch.abs() >= eps_mask)
+            )
 
             if mask_ch.sum() == 0:
                 continue
@@ -448,40 +425,18 @@ def train_single_channel(channel_idx, dataset, meta):
                 else:
                     loss = loss_main
             else:
-                # ========= Ion：log 域 μ / logvar + 异方差 NLL =========
-                y_pred = pred  # (B,2,T)
-                z_mu = y_pred[:, 1:2, :]     # (B,1,T) 约定为 log 域均值
-                logvar = y_pred[:, 0:1, :]   # (B,1,T) 约定为 logvar
-
-                # 提取 Ion 通道真值
-                y_true_ch = phys_tgt[:, 1:2, :]
-                m_ch = pmask[:, 1:2, :].float()
-
-                # 物理裁剪
+                # ========= Ion_Flux：简化为纯 L1 损失 =========
                 y_true_ch = torch.clamp(
-                    y_true_ch,
+                    phys_tgt[:, 1:2, :],
                     min=getattr(Cfg, "ion_y_min", 0.0),
-                    max=getattr(Cfg, "ion_y_max", 50.0)
+                    max=getattr(Cfg, "ion_y_max", 50.0),
                 )
+                m_ch = mask_ch  # 仅使用基础掩码（过滤无效值）
 
-                # log 域目标
-                y_log = to_log_domain(y_true_ch, ion_c)
-
-                # 样本权重（大 Ion 加权）
-                w_mag = ion_weight(y_true_ch, m_ch)
-                eff_mask = m_ch * w_mag
-
-                # 异方差 NLL
-                nll = hetero_gaussian_nll(z_mu, logvar, y_log, eff_mask)
-
-                # 再加一个 Huber 正则（只对 mu）
-                huber = F.smooth_l1_loss(
-                    z_mu[eff_mask.bool()],
-                    y_log[eff_mask.bool()],
-                    reduction="mean"
-                )
-                huber_lambda = getattr(Cfg, "ion_huber_lambda", 0.1)
-                loss = nll + huber_lambda * huber
+                # 纯 L1 损失（无加权）
+                loss_e = torch.abs(pred_ch_raw - y_true_ch)
+                loss_main = (loss_e * m_ch.float()).sum() / m_ch.float().sum().clamp_min(1e-6)
+                loss = loss_main
 
             opt.zero_grad()
             loss.backward()
@@ -506,11 +461,14 @@ def train_single_channel(channel_idx, dataset, meta):
                 phys_tgt = phys_tgt.to(dev)
                 pmask = pmask.to(dev)
                 tvals = tvals.to(dev)
+
                 pred = model(s8, tvals)
                 pred_ch_raw = pred[:, channel_idx:channel_idx + 1, :]
                 tgt_ch = phys_tgt[:, channel_idx:channel_idx + 1, :]
-                mask_ch = (pmask[:, channel_idx:channel_idx + 1, :] &
-                           (tgt_ch.abs() >= eps_mask))
+                mask_ch = (
+                    pmask[:, channel_idx:channel_idx + 1, :]
+                    & (tgt_ch.abs() >= eps_mask)
+                )
                 if mask_ch.sum() == 0:
                     continue
 
@@ -521,72 +479,22 @@ def train_single_channel(channel_idx, dataset, meta):
                     loss_main = (loss_e * w).sum() / (w.sum().clamp_min(1e-6))
                     val_loss = loss_main
                 else:
-                    # ========= Ion 验证：用和训练同一套 z_mu/logvar 逻辑 =========
-                    y_pred = pred  # (B,2,T)
-                    z_mu = y_pred[:, 1:2, :]   # log 域均值
-                    logvar = y_pred[:, 0:1, :]  # logvar
-
-                    y_true_ch = phys_tgt[:, 1:2, :]
-                    m_ch = pmask[:, 1:2, :].float()
-
+                    # 验证阶段同样使用纯 L1 损失
                     y_true_ch = torch.clamp(
-                        y_true_ch,
+                        phys_tgt[:, 1:2, :],
                         min=getattr(Cfg, "ion_y_min", 0.0),
-                        max=getattr(Cfg, "ion_y_max", 50.0)
+                        max=getattr(Cfg, "ion_y_max", 50.0),
                     )
-                    y_log = to_log_domain(y_true_ch, ion_c)
-
-                    # 验证时使用未加权 mask
-                    eff_mask = m_ch
-
-                    nll = hetero_gaussian_nll(z_mu, logvar, y_log, eff_mask)
-                    huber = F.smooth_l1_loss(
-                        z_mu[eff_mask.bool()],
-                        y_log[eff_mask.bool()],
-                        reduction="mean"
-                    )
-                    huber_lambda = getattr(Cfg, "ion_huber_lambda", 0.1)
-                    val_loss = nll + huber_lambda * huber
+                    m_ch = mask_ch
+                    loss_e = torch.abs(pred_ch_raw - y_true_ch)
+                    val_loss = (loss_e * m_ch.float()).sum() / m_ch.float().sum().clamp_min(1e-6)
 
                 s += float(val_loss) * s8.size(0)
                 n += s8.size(0)
 
         val = s / max(1, n)
         va_hist.append(val)
-
-        if is_F:
-            print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
-        else:
-            # 诊断：log 域 μ/σ
-            with torch.no_grad():
-                try:
-                    s8_dbg, phys_tgt_dbg, pmask_dbg, tvals_dbg = next(iter(va))
-                    s8_dbg = s8_dbg.to(dev)
-                    phys_tgt_dbg = phys_tgt_dbg.to(dev)
-                    pmask_dbg = pmask_dbg.to(dev)
-                    tvals_dbg = tvals_dbg.to(dev)
-                    y_pred_dbg = model(s8_dbg, tvals_dbg)
-                    z = y_pred_dbg[:, 1:2, :]
-                    tgt = phys_tgt_dbg[:, 1:2, :]
-                    m = (pmask_dbg[:, 1:2, :] & (tgt > 0))
-                    y_log_dbg = to_log_domain(tgt, ion_c)
-                    zp = z[m]
-                    yt = y_log_dbg[m]
-                    if zp.numel() > 0:
-                        p_mean = float(zp.mean())
-                        p_std = float(zp.std(unbiased=False))
-                        t_mean = float(yt.mean())
-                        t_std = float(yt.std(unbiased=False))
-                        ratio = p_std / (t_std + 1e-12)
-                        print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
-                        print(
-                            f"[DBG-{ch_name}][{e}] log pred μ/σ={p_mean:.4f}/{p_std:.4f}  "
-                            f"log tgt μ/σ={t_mean:.4f}/{t_std:.4f}  ratio={ratio:.3f}  ion_c={ion_c:.2e}"
-                        )
-                    else:
-                        print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f} (no valid Ion points)")
-                except StopIteration:
-                    print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
+        print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
 
         # ====== 保存最优 ======
         if val < best:
@@ -596,10 +504,6 @@ def train_single_channel(channel_idx, dataset, meta):
                 "meta": _clean_meta(meta),
                 "hist": {"train": tr_hist, "val": va_hist},
             }
-            if not is_F:
-                ckpt["ion_affine"] = {"c": float(ion_c)}
-                if ion_arch is not None:
-                    ckpt["ion_arch"] = ion_arch
             torch.save(ckpt, best_path)
             print("  -> saved", best_path)
 
@@ -612,25 +516,12 @@ def train_single_channel(channel_idx, dataset, meta):
 
     return best_path
 
-
-# ================== Ion: log→linear 反变换 ==================
 def ion_inverse_for_export(z_logits: torch.Tensor, ckpt: dict) -> torch.Tensor:
     """
-    把 Ion 的模型输出 z_mu (B,1,T) 还原到物理量域：
-        y_hat = exp(z_mu) - c
-    c 来自训练 ckpt["ion_affine"]["c"]；若缺失则回退到 Cfg.ion_c_min。
+    现在 Ion_Flux 直接在物理域上训练，ckpt 中不再带 ion_affine。
+    导出阶段只需要做一次非负裁剪，保持与 F_Flux 一样的单位。
     """
-    aff = ckpt.get("ion_affine", None)
-    if aff is None:
-        c = getattr(Cfg, "ion_c_min", 1e-6)
-    else:
-        c = float(aff.get("c", getattr(Cfg, "ion_c_min", 1e-6)))
-
-    c_t = torch.tensor(c, dtype=z_logits.dtype, device=z_logits.device).view(1, 1, 1)
-    y = torch.exp(z_logits) - c_t
-    return torch.clamp(y, min=0.0)
-
-
+    return torch.clamp(z_logits, min=0.0)
 # -------------------- 主流程 --------------------
 def main():
     set_seed(Cfg.seed)
@@ -863,4 +754,96 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    dataset, meta = excel_to_physics_dataset(
+        ACfg.old_excel,
+        sheet_name=ACfg.sheet_name
+    )
+    # dataset: TensorDataset(static_norm, phys_seq, targets, mask, time_mat)
+    static_norm, phys_seq, targets, mask, time_mat = dataset.tensors
+
+    static_norm = static_norm.numpy().astype(np.float32)  # (N, 8)
+    phys_seq = phys_seq.numpy().astype(np.float32)  # (N, 2, T)  [F_Flux, Ion_Flux]
+    time_vals = np.asarray(meta["time_values"], dtype=np.float32)
+    T = phys_seq.shape[2]
+
+    # ==== 2. 反归一化静态工艺参数 ====
+    norm_static = meta["norm_static"]  # dict: mean/std (torch tensors, shape (8,))
+    s_mean = norm_static["mean"].numpy().astype(np.float32)
+    s_std = norm_static["std"].numpy().astype(np.float32)
+
+    static_orig = static_norm * s_std[None, :] + s_mean[None, :]  # (N, 8)
+    static_keys = meta.get("static_keys", [f"P{i}" for i in range(static_orig.shape[1])])
+
+    # ==== 3. 提取 Ion_Flux 序列及汇总指标 ====
+    # phys_seq[:, 0, :] -> F_Flux;  phys_seq[:, 1, :] -> Ion_Flux
+    ion_seq = phys_seq[:, 1, :]  # (N, T)
+
+    # 几个代表性的汇总指标
+    ion_mean = ion_seq.mean(axis=1)  # 每个样本在时间上的平均 Ion
+    ion_last = ion_seq[:, -1]  # 最后一个时间点
+    ion_max = ion_seq.max(axis=1)  # 最大值
+
+    # ==== 4. 组装 DataFrame 做相关性分析 ====
+    # 4.1 静态参数 + Ion 汇总指标
+    df_summary = pd.DataFrame(static_orig, columns=static_keys)
+    df_summary["Ion_mean"] = ion_mean
+    df_summary["Ion_last"] = ion_last
+    df_summary["Ion_max"] = ion_max
+
+    corr_summary = df_summary.corr(method="pearson")
+
+    # 4.2 静态参数 vs 各时间点 Ion_Flux(t_k)
+    cols_time = []
+    data_time = []
+
+    for t_idx in range(T):
+        cols_time.append(f"Ion_t{t_idx}")
+        data_time.append(ion_seq[:, t_idx])
+
+    df_time = pd.DataFrame(static_orig, columns=static_keys)
+    for name, col in zip(cols_time, data_time):
+        df_time[name] = col
+
+    # 相关性矩阵：行 = 所有变量，列 = 所有变量
+    corr_time_full = df_time.corr(method="pearson")
+
+    # 我们更关心的是：静态参数(行) vs Ion_t*(列)
+    corr_time = corr_time_full.loc[static_keys, cols_time]
+
+    # 4.3 各时间点之间的 Ion_Flux 自身相关性（T x T）
+    df_ion_only = pd.DataFrame(ion_seq, columns=cols_time)
+    corr_ion_ion = df_ion_only.corr(method="pearson")
+
+    # ==== 5. 保存结果 ====
+    out_dir = os.path.join(ACfg.save_dir, "corr_analysis")
+    os.makedirs(out_dir, exist_ok=True)
+
+    corr_summary.to_csv(os.path.join(out_dir, "corr_static_vs_ion_summary.csv"),
+                        float_format="%.4f")
+    corr_time.to_csv(os.path.join(out_dir, "corr_static_vs_ion_by_time.csv"),
+                     float_format="%.4f")
+    corr_ion_ion.to_csv(os.path.join(out_dir, "corr_ion_vs_ion_time_matrix.csv"),
+                        float_format="%.4f")
+
+    print("[OK] 已输出：")
+    print("  -", os.path.join(out_dir, "corr_static_vs_ion_summary.csv"))
+    print("  -", os.path.join(out_dir, "corr_static_vs_ion_by_time.csv"))
+    print("  -", os.path.join(out_dir, "corr_ion_vs_ion_time_matrix.csv"))
+
+    # ==== 6. 可选：画一个时间相关性的热力图（方便快速看时间维度是否退化） ====
+    try:
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(6, 5))
+        im = plt.imshow(corr_ion_ion.values, vmin=-1, vmax=1, aspect="auto")
+        plt.colorbar(im, label="Pearson r")
+        plt.xticks(range(T), [f"t{idx}" for idx in range(T)], rotation=45)
+        plt.yticks(range(T), [f"t{idx}" for idx in range(T)])
+        plt.title("Ion_Flux Time-Time Correlation")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "corr_ion_vs_ion_time_heatmap.png"), dpi=200)
+        plt.close()
+        print("  -", os.path.join(out_dir, "corr_ion_vs_ion_time_heatmap.png"))
+    except Exception as e:
+        print("[WARN] 画热力图失败（缺少 matplotlib 或其它原因）：", e)

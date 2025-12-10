@@ -7,7 +7,9 @@ Stage B: 旧表训练形貌网络（逐 family 标准化 + 独立输出头）
 import os
 import numpy as np
 import torch
+import pandas as pd
 from torch.utils.data import DataLoader, random_split
+
 
 from physio_util import (
     set_seed,
@@ -58,6 +60,8 @@ class Cfg:
     export_family_alone = True        # 导出每个 family 的独立文件/图
     nonneg_families = None            # 例：list(range(len(FAMILIES))) 让所有家族展示非负
 
+    phys_mode = "full"
+
 
 def _masked_l1_per_family(pred, target, mask):
     """
@@ -90,7 +94,56 @@ def _select_family(x, k):
     """从 (B,K,T) 张量中取出第 k 个 family → (B,1,T)"""
     return x[:, k:k+1, :]
 
+def _apply_phys_mode(phys, mode):
+    if mode == "full":
+        return phys  # (B,2,T)
+    phys_used = torch.zeros_like(phys)
+    if mode == "ion_only":
+        phys_used[:, 1:2, :] = phys[:, 1:2, :]
+        return phys_used
+    if mode == "flux_only":
+        phys_used[:, 0:1, :] = phys[:, 0:1, :]
+        return phys_used
+    if mode == "none":
+        return phys_used
+    return phys  # 默认不变
 
+def _export_heatmap_to_excel(mtx, families, time_values, out_path):
+    df = pd.DataFrame(mtx, index=families, columns=time_values)
+    df.index.name = "Family\\Time"
+    df.to_excel(out_path)
+def _export_parity_to_excel(yhat, ytrue, mask, families, time_values, out_path):
+    B,K,T = yhat.shape
+    records = []
+    for b in range(B):
+        for k in range(K):
+            for t in range(T):
+                if mask[b,k,t]:
+                    records.append({
+                        "Sample": b,
+                        "Family": families[k],
+                        "Time": time_values[t],
+                        "Predicted": float(yhat[b,k,t].cpu().numpy()),
+                        "True": float(ytrue[b,k,t].cpu().numpy())
+                    })
+    df = pd.DataFrame.from_records(records)
+    df.to_excel(out_path, index=False)
+
+def _export_residuals_to_excel(yhat, ytrue, mask, families, time_values, out_path):
+    B,K,T = yhat.shape
+    records = []
+    for b in range(B):
+        for k in range(K):
+            for t in range(T):
+                if mask[b,k,t]:
+                    records.append({
+                        "Sample": b,
+                        "Family": families[k],
+                        "Time": time_values[t],
+                        "Residual": float((yhat[b,k,t] - ytrue[b,k,t]).cpu().numpy())
+                    })
+    df = pd.DataFrame.from_records(records)
+    df.to_excel(out_path, index=False)
 def main():
     os.makedirs(Cfg.save_dir, exist_ok=True)
     set_seed(Cfg.seed)
@@ -133,6 +186,7 @@ def main():
 
         for s8, phys, trg, msk, tvals in tr_loader:
             s8, phys, trg, msk, tvals = [x.to(device) for x in (s8, phys, trg, msk, tvals)]
+            phys = _apply_phys_mode(phys, Cfg.phys_mode)
             opt.zero_grad(set_to_none=True)
 
             if Cfg.amp:
@@ -164,6 +218,7 @@ def main():
         with torch.no_grad():
             for s8, phys, trg, msk, tvals in va_loader:
                 s8, phys, trg, msk, tvals = [x.to(device) for x in (s8, phys, trg, msk, tvals)]
+                phys = _apply_phys_mode(phys, Cfg.phys_mode)
                 pred = model(s8, phys, tvals)
                 pred, trg = _maybe_denorm_targets(pred, trg, meta, device)
 
@@ -246,6 +301,18 @@ def main():
                            os.path.join(Cfg.save_dir, "morph_scatter.png"), "Morph Parity")
             residual_hist(yhat_disp, ytrue_disp, msk,
                           os.path.join(Cfg.save_dir, "morph_residual.png"), "Morph Residuals")
+            _export_heatmap_to_excel(
+                mts["R2"], FAMILIES, meta["time_values"],
+                os.path.join(Cfg.save_dir, "morph_r2_data.xlsx")
+            )
+            _export_parity_to_excel(
+                yhat_disp, ytrue_disp, msk, FAMILIES, meta["time_values"],
+                os.path.join(Cfg.save_dir, "morph_scatter_data.xlsx")
+            )
+            _export_residuals_to_excel(
+                yhat_disp, ytrue_disp, msk, FAMILIES, meta["time_values"],
+                os.path.join(Cfg.save_dir, "morph_residual_data.xlsx")
+            )
 
             # ===== 逐 family 独立导出（关键）=====
             if Cfg.export_family_alone:
@@ -270,7 +337,6 @@ def main():
                     write_summary_txt(mts_k, fam_list, meta["time_values"], fam_dir)
 
                     # 作图（只画该 family）
-                    # 热力图对单 family 是 1×T 的条状图，照样能看各时间点
                     heatmap(mts_k["R2"], fam_list, meta["time_values"], f"{fam} R2",
                             os.path.join(fam_dir, f"{fam}_r2.png"))
                     parity_scatter(
@@ -283,11 +349,53 @@ def main():
                         os.path.join(fam_dir, f"{fam}_residual.png"),
                         f"{fam} Residuals"
                     )
+
+                    # ★ 单 family 图表数据导出（方便单独在 Origin 画）
+                    _export_heatmap_to_excel(
+                        mts_k["R2"], fam_list, meta["time_values"],
+                        os.path.join(fam_dir, f"{fam}_r2_data.xlsx")
+                    )
+                    _export_parity_to_excel(
+                        yh_k, yt_k, m_k, fam_list, meta["time_values"],
+                        os.path.join(fam_dir, f"{fam}_scatter_data.xlsx")
+                    )
+                    _export_residuals_to_excel(
+                        yh_k, yt_k, m_k, fam_list, meta["time_values"],
+                        os.path.join(fam_dir, f"{fam}_residual_data.xlsx")
+                    )
             break  # 只导出一批
 
     save_manifest(Cfg.save_dir)
     print("[OK] Stage B done.")
+    return best_overall, best_per_fam
 
 
 if __name__ == "__main__":
-    main()
+    mode = ["full", "ion_only", "flux_only", "none"]
+    header = ["phys_mode", "overall_R2"] + list(FAMILIES)
+    summary_rows = []
+    print(f"Running Stage B with phys_mode='{Cfg.phys_mode}'...")
+    if Cfg.phys_mode not in mode:
+        print(f"  Warning: unrecognized phys_mode '{Cfg.phys_mode}', defaulting to 'full'.")
+    for m in mode:
+        Cfg.phys_mode = m
+        print(f"\n=== phys_mode = '{m}' ===")
+        Cfg.save_dir = f"./runs_morph_old/{m}"
+        print("\n" + "=" * 80)
+        print(f"[RUN] phys_mode={m}, save_dir={Cfg.save_dir}")
+        print("=" * 80)
+
+        best_overall, best_per_fam = main()
+
+        row = [m, f"{best_overall:.4f}"]
+        for k in range(len(FAMILIES)):
+            row.append(f"{best_per_fam[k]:.4f}")
+        summary_rows.append(row)
+    # 汇总表
+    summary_path = "./runs_morph_old/summary_phys_mode_comparison.csv"
+    with open(summary_path, "w") as f:
+        f.write(",".join(header) + "\n")
+        for row in summary_rows:
+            f.write(",".join(row) + "\n")
+    print(f"\n[ALL DONE] Summary of phys_mode comparison saved to {summary_path}.")
+

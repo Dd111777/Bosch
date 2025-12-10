@@ -4,11 +4,17 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="test1">
-      <change afterPath="$PROJECT_DIR$/stageCselection_advanced.py" afterDir="false" />
+    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.4">
+      <change afterPath="$PROJECT_DIR$/analyze_distrbution.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/Bosch.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/Bosch.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm_new.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm_new.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stageCselection.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageCselection.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bosch.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/Bosch.xlsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/comparison_experiments_COMPLETE.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/comprehensive_experiments.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/physio_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/physio_util.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageCselection.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -31,12 +37,15 @@
     &quot;assignee&quot;: &quot;Dd111777&quot;
   }
 }</component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/Dd111777/Bosch.git",
-    "accountId": "2c46bef3-26b9-4c23-98f1-8bb513ad9da5"
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/Dd111777/Bosch.git&quot;,
+    &quot;accountId&quot;: &quot;2c46bef3-26b9-4c23-98f1-8bb513ad9da5&quot;
   }
-}]]></component>
+}</component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="CurrentFile" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 4
 }</component>
@@ -48,13 +57,15 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Python.analyze_distrbution.executor": "Run",
+    "Python.plasma.executor": "Run",
     "Python.stageCselection.executor": "Run",
     "Python.test.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "master",
     "last_opened_file_path": "D:/PycharmProjects/Bosch",
-    "settings.editor.selected.configurable": "configurable.group.editor"
+    "settings.editor.selected.configurable": "preferences.pluginManager"
   }
 }]]></component>
   <component name="SharedIndexes">
@@ -100,7 +111,31 @@
       <option name="project" value="LOCAL" />
       <updated>1763519917939</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="test1">
+      <option name="closed" value="true" />
+      <created>1764138976012</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1764138976012</updated>
+    </task>
+    <task id="LOCAL-00005" summary="11.28">
+      <option name="closed" value="true" />
+      <created>1764311387320</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1764311387320</updated>
+    </task>
+    <task id="LOCAL-00006" summary="12.4">
+      <option name="closed" value="true" />
+      <created>1764818293618</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1764818293618</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -119,7 +154,9 @@
       <path value="$PROJECT_DIR$" />
     </ignored-roots>
     <MESSAGE value="test1" />
-    <option name="LAST_COMMIT_MESSAGE" value="test1" />
+    <MESSAGE value="11.28" />
+    <MESSAGE value="12.4" />
+    <option name="LAST_COMMIT_MESSAGE" value="12.4" />
   </component>
   <component name="github-copilot-workspace">
     <instructionFileLocations>

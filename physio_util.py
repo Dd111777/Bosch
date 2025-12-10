@@ -66,16 +66,6 @@ def _find_series(df_cols: List[str], prefix_norm: str) -> Tuple[List[str], List[
 
 # --------------- A：旧表→物理数据集 ----------------
 def excel_to_physics_dataset(excel_path: str, sheet_name=None):
-    """
-    返回：
-      dataset: TensorDataset(static_norm, phys_target, phys_mask, time_values_batch)
-        - static_norm: (N,8)
-        - phys_target: (N,2,T)  [0:F_Flux, 1:Ion_Flux]
-        - phys_mask:   (N,2,T)
-        - time_values_batch: (N,T)  —— 每个样本一份时间刻度，便于 DataLoader 解包时四元组对齐
-      meta:
-        - T, time_values(1D), norm_static(mean,std)
-    """
     import pandas as pd
     df = pd.read_excel(excel_path, sheet_name=sheet_name)
     cols = list(df.columns)
@@ -108,16 +98,6 @@ def excel_to_physics_dataset(excel_path: str, sheet_name=None):
         _pick_one(cols, key_alias["dep_time"]),
         _pick_one(cols, key_alias["etch_time"]),
     ]
-    # static_keys = [
-    #     _pick_one(cols, key_alias["temp"]),
-    #     _pick_one(cols, key_alias["apc"]),
-    #     _pick_one(cols, key_alias["source_rf"]),
-    #     _pick_one(cols, key_alias["lf_rf"]),
-    #     _pick_one(cols, key_alias["sf6"]),
-    #     _pick_one(cols, key_alias["c4f8"]),
-    #     _pick_one(cols, key_alias["dep_time"]),
-    #     _pick_one(cols, key_alias["etch_time"]),
-    # ]
     if not all(static_keys):
         raise RuntimeError(f"8个输入列不全：{static_keys}")
 
@@ -167,16 +147,6 @@ def excel_to_physics_dataset(excel_path: str, sheet_name=None):
 
 # --------------- B：旧表→形貌数据集 ----------------
 def excel_to_morph_dataset_from_old(excel_path: str, sheet_name=None):
-    """
-    返回：
-      static_norm (N,8)
-      phys_seq    (N,2,T)
-      targets     (N,K,T)
-      mask        (N,K,T)
-      time_values (T,)
-      norm_static(mean,std)
-    形貌标签列名：支持 zmin_*, h0_*, h1_*, d0_*, d1_*, w1..w9
-    """
     df = pd.read_excel(excel_path, sheet_name=sheet_name)
     cols = list(df.columns)
     # 8输入
