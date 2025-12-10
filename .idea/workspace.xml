@@ -4,18 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.4">
-      <change afterPath="$PROJECT_DIR$/analyze_distrbution.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/Bosch.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/Bosch.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Bosch.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/Bosch.xlsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/comparison_experiments_COMPLETE.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/comprehensive_experiments.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/physio_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/physio_util.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stageCselection.py" beforeDir="false" />
-    </list>
+    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.10" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -135,7 +124,15 @@
       <option name="project" value="LOCAL" />
       <updated>1764818293618</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="12.10">
+      <option name="closed" value="true" />
+      <created>1765343539500</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1765343539500</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -156,7 +153,8 @@
     <MESSAGE value="test1" />
     <MESSAGE value="11.28" />
     <MESSAGE value="12.4" />
-    <option name="LAST_COMMIT_MESSAGE" value="12.4" />
+    <MESSAGE value="12.10" />
+    <option name="LAST_COMMIT_MESSAGE" value="12.10" />
   </component>
   <component name="github-copilot-workspace">
     <instructionFileLocations>
