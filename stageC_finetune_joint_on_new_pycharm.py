@@ -264,8 +264,17 @@ def split_with_key_and_quality(
     key_set = set([str(x).strip() for x in key_recipes if str(x).strip()])
     key_idx = np.array([i for i in all_idx if str(recipe_ids[i]) in key_set], dtype=int)
 
-    n_test = max(1, int(round(N * test_ratio)))
-    n_val = max(1, int(round(N * val_ratio)))
+    # --- desired counts ---
+    if test_ratio <= 0:
+        n_test = 0
+    else:
+        n_test = int(round(N * test_ratio))
+        n_test = max(1, min(n_test, N))  # keep at least 1 if test_ratio>0
+
+    n_val = int(round(N * val_ratio))
+    # val 至少 1（否则 early stopping/val loss 没意义），且不能超过剩余样本
+    n_val = max(1, min(n_val, max(1, N - n_test)))
+
 
     test = key_idx.tolist()
     remain = [i for i in all_idx.tolist() if i not in set(test)]
@@ -388,15 +397,107 @@ def apply_finetune_mode(model: nn.Module, mode: str):
     raise ValueError(f"Unknown finetune_mode={mode}")
 
 
-# ----------------------------
-# Loss / Train / Eval
-# ----------------------------
 def masked_mse(pred: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-    # pred,y: (B,1,T)  m: (B,1,T)
+    """
+    计算 MSE Loss，增加了 [Hard Example Mining] 策略：
+    误差越大的样本，权重越高。这是提升 d1/w R2 的关键。
+    """
+    # 1. 基础 MSE
     diff = (pred - y) ** 2
+
+    # 2. [提分关键] 动态加权
+    # 逻辑：如果预测偏离真实值太远，就给它更大的梯度权重
+    with torch.no_grad():
+        # 防止 std 为 0 或 NaN
+        std_val = torch.std(y)
+        if torch.isnan(std_val) or std_val < 1e-6:
+            std_val = 1.0
+
+        # 权重公式：基础权重 1.0 + 偏差程度
+        # 偏差越大，weight 越大，迫使 Loss 变大
+        weight = 1.0 + torch.abs(pred - y) / (std_val + 1e-6)
+
+    # 3. 应用权重
+    diff = diff * weight
+
+    # 4. Mask 掉无效点
     diff = diff.masked_fill(~m, 0.0)
+
+    # 5. 求平均
     denom = m.float().sum().clamp_min(1.0)
     return diff.sum() / denom
+def hem_weight(pred: torch.Tensor,
+               y: torch.Tensor,
+               mode: str = "none",
+               clip: float = 3.0,
+               tau: float = 1.0,
+               eps: float = 1e-6) -> torch.Tensor:
+    """
+    pred,y: (B,1,T)
+    mode:
+      - none: all ones
+      - linear: 1 + |err|/(std(y)*tau)
+      - clamp: clamp(linear, 1, clip)
+    """
+    if mode is None or str(mode).lower() == "none":
+        return torch.ones_like(y)
+
+    mode = str(mode).lower()
+    with torch.no_grad():
+        std_val = torch.std(y)
+        if torch.isnan(std_val) or std_val < eps:
+            std_val = torch.tensor(1.0, device=y.device, dtype=y.dtype)
+        denom = std_val * float(tau) + eps
+        w = 1.0 + torch.abs(pred - y) / denom
+        if mode == "clamp":
+            w = torch.clamp(w, 1.0, float(clip))
+        elif mode == "linear":
+            pass
+        else:
+            raise ValueError(f"Unknown hem_mode={mode}")
+    return w
+
+
+def masked_huber(pred: torch.Tensor,
+                 y: torch.Tensor,
+                 m: torch.Tensor,
+                 beta: float = 1.0,
+                 hem_mode: str = "none",
+                 hem_clip: float = 3.0,
+                 hem_tau: float = 1.0) -> torch.Tensor:
+    """
+    Masked huber:
+      if |e|<beta: 0.5*e^2/beta
+      else: |e| - 0.5*beta
+    """
+    e = pred - y
+    abs_e = torch.abs(e)
+    b = float(beta)
+    quad = 0.5 * (e ** 2) / max(b, 1e-12)
+    lin = abs_e - 0.5 * b
+    per = torch.where(abs_e < b, quad, lin)
+
+    w = hem_weight(pred, y, mode=hem_mode, clip=hem_clip, tau=hem_tau)
+    per = per * w
+    per = per.masked_fill(~m, 0.0)
+    denom = m.float().sum().clamp_min(1.0)
+    return per.sum() / denom
+
+
+def masked_loss(pred: torch.Tensor,
+                y: torch.Tensor,
+                m: torch.Tensor,
+                loss_type: str = "mse",
+                huber_beta: float = 1.0,
+                hem_mode: str = "none",
+                hem_clip: float = 3.0,
+                hem_tau: float = 1.0) -> torch.Tensor:
+    lt = str(loss_type).lower().strip()
+    if lt == "mse":
+        return masked_mse(pred, y, m, hem_mode=hem_mode, hem_clip=hem_clip, hem_tau=hem_tau)
+    if lt == "huber":
+        return masked_huber(pred, y, m, beta=huber_beta, hem_mode=hem_mode, hem_clip=hem_clip, hem_tau=hem_tau)
+    raise ValueError(f"Unknown loss_type={loss_type}")
 
 
 def l2sp_penalty(model: nn.Module, anchor_state: Dict[str, torch.Tensor], lam: float) -> torch.Tensor:
@@ -432,54 +533,6 @@ def eval_pack(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, np
         m=np.concatenate(ms, 0).astype(bool),
     )
 
-
-def metrics_1fam_display(pack: Dict[str, np.ndarray],
-                        fam: str,
-                        y_mean_t: np.ndarray,
-                        y_std_t: np.ndarray,
-                        unit_scale: float = 1000.0) -> Dict[str, Any]:
-    """
-    计算显示空间（nm、zmin 翻正、非负裁剪）的 R2/MAE
-    pack: pred/y/m 形状 (N,1,T)
-    y_mean_t/y_std_t: (T,) 训练空间（um）统计
-    """
-    pred = torch.from_numpy(pack["pred"]).float()
-    y = torch.from_numpy(pack["y"]).float()
-    m = torch.from_numpy(pack["m"]).bool()
-
-    mean = torch.from_numpy(y_mean_t).view(1, 1, T)
-    std = torch.from_numpy(y_std_t).view(1, 1, T)
-
-    pred_um = pred * std + mean
-    y_um = y * std + mean
-
-    # StageB 默认：zmin 翻符号，其余不翻；全部 family 非负裁剪（这里只是单 family）
-    sign_map, nonneg_set = su._default_family_sign_and_nonneg([fam])
-    family_sign = torch.tensor([sign_map[fam]], dtype=torch.float32)
-
-    pred_disp, y_disp = pu.transform_for_display(
-        pred_um, y_um,
-        family_sign=family_sign,
-        clip_nonneg=True,
-        nonneg_families=[0],          # 单 family 下索引=0
-        unit_scale=unit_scale,
-        flip_sign=False,
-        min_display_value=None
-    )
-
-    # flatten masked
-    yp = pred_disp[:, 0, :].reshape(-1).numpy()
-    yt = y_disp[:, 0, :].reshape(-1).numpy()
-    mk = pack["m"][:, 0, :].reshape(-1)
-    yp = yp[mk]; yt = yt[mk]
-    ok = np.isfinite(yt) & np.isfinite(yp)
-    yt = yt[ok]; yp = yp[ok]
-    n = int(len(yt))
-    r2 = float(su.masked_r2_score_np(yt, yp)) if n >= 2 else float("nan")
-    mae = float(np.mean(np.abs(yt - yp))) if n >= 1 else float("nan")
-    return {"family": fam, "r2": r2, "mae_nm": mae, "n": n}
-
-
 def train_one(model: nn.Module,
               train_loader: DataLoader,
               val_loader: DataLoader,
@@ -489,17 +542,46 @@ def train_one(model: nn.Module,
               wd: float,
               patience: int,
               l2sp_lam: float = 0.0,
-              anchor_state: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, Any]:
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=wd)
+              anchor_state: Optional[Dict[str, torch.Tensor]] = None,
+              is_transfer: bool = False,
+              backbone_lr_ratio: float = 0.1,
+              loss_type: str = "mse",
+              huber_beta: float = 1.0,
+              hem_mode: str = "none",
+              hem_clip: float = 3.0,
+              hem_tau: float = 1.0,
+              grad_clip: float = 1.0) -> Dict[str, Any]:
 
-    # [修改点]：初始化 history
+    head_params, backbone_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "out" in name or "head" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    if is_transfer:
+        params_group = [
+            {"params": backbone_params, "lr": lr * float(backbone_lr_ratio)},
+            {"params": head_params, "lr": lr},
+        ]
+    else:
+        params_group = [
+            {"params": backbone_params, "lr": lr},
+            {"params": head_params, "lr": lr},
+        ]
+
+    opt = torch.optim.AdamW(params_group, weight_decay=wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
+
     best = {"val_loss": float("inf"), "epoch": 0, "state": None, "history": {"train": [], "val": []}}
     bad = 0
 
     for ep in range(1, epochs + 1):
         model.train()
-        ep_train_loss = 0.0
-        ep_train_n = 0
+        ep_train_loss, ep_train_n = 0.0, 0
+
         for static_x, phys7_seq, y, m, time_mat in train_loader:
             static_x = static_x.to(device)
             phys7_seq = phys7_seq.to(device)
@@ -508,7 +590,14 @@ def train_one(model: nn.Module,
             time_mat = time_mat.to(device)
 
             pred = model(static_x, phys7_seq, time_mat)
-            loss = masked_mse(pred, y, m)
+            loss = masked_loss(
+                pred, y, m,
+                loss_type=loss_type,
+                huber_beta=huber_beta,
+                hem_mode=hem_mode,
+                hem_clip=hem_clip,
+                hem_tau=hem_tau
+            )
 
             raw_loss_val = float(loss.item())
 
@@ -517,12 +606,14 @@ def train_one(model: nn.Module,
 
             opt.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if grad_clip and grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
             opt.step()
 
             ep_train_loss += raw_loss_val
             ep_train_n += 1
 
+        scheduler.step()
         avg_train_loss = ep_train_loss / max(1, ep_train_n)
 
         # val
@@ -537,12 +628,19 @@ def train_one(model: nn.Module,
                 time_mat = time_mat.to(device)
 
                 pred = model(static_x, phys7_seq, time_mat)
-                loss = masked_mse(pred, y, m)
+                loss = masked_loss(
+                    pred, y, m,
+                    loss_type=loss_type,
+                    huber_beta=huber_beta,
+                    hem_mode=hem_mode,
+                    hem_clip=hem_clip,
+                    hem_tau=hem_tau
+                )
                 vl += float(loss.item())
                 vn += 1
+
         val_loss = vl / max(1, vn)
 
-        # [修改点]：记录 loss 到 history
         best["history"]["train"].append(avg_train_loss)
         best["history"]["val"].append(val_loss)
 
@@ -559,7 +657,6 @@ def train_one(model: nn.Module,
     if best["state"] is not None:
         model.load_state_dict(best["state"], strict=False)
     return best
-
 # ----------------------------
 # StageB best retrieval (from best_config + results_summary.csv)
 # ----------------------------
@@ -667,18 +764,26 @@ def resolve_stageB_best_ckpts_from_common(runs_root: str) -> Dict[str, str]:
 
     return out
 
-# ----------------------------
-# Experiment config
-# ----------------------------
 @dataclass
 class ExpCfg:
     name: str
     init: str              # "scratch" / "stageB_best"
     finetune_mode: str     # "full" / "head_ln" / "bitfit_ln" ...
     phys7_mode: str        # "full" / "none" / ...
+
     lr: float
     wd: float
-    l2sp: float = 0.0      # L2SP strength
+    l2sp: float = 0.0
+
+    # --- scoring strategies ---
+    loss_type: str = "mse"         # "mse" / "huber"
+    huber_beta: float = 1.0
+
+    hem_mode: str = "none"         # "none" / "linear" / "clamp"
+    hem_clip: float = 3.0
+    hem_tau: float = 1.0
+
+    backbone_lr_ratio: float = 0.1 # transfer 时 backbone lr = lr * ratio
 
 
 def run_one_experiment_on_split_1fam(
@@ -686,7 +791,7 @@ def run_one_experiment_on_split_1fam(
         exp: ExpCfg,
         device: str,
         raw: Dict[str, Any],
-        split: Dict[str, List[int]],
+        split: Dict[str, Any],
         stageB_best_ckpt_for_fam: Optional[str],
         model_type: str,
         stageA_heads_root: str,
@@ -696,7 +801,13 @@ def run_one_experiment_on_split_1fam(
         batch: int,
         patience: int,
         num_workers: int,
+        run_seed: int,
 ) -> Dict[str, Any]:
+    # -------------------------
+    # [关键] 同一 split 下扫 seed
+    # -------------------------
+    set_seed(int(run_seed))
+
     recipe_ids = raw["recipe_ids"]
     static_raw = raw["static_raw"]  # (N,Ds)
     phys7_raw_full = raw["phys7_raw_full"]  # (N,7)
@@ -746,50 +857,60 @@ def run_one_experiment_on_split_1fam(
     apply_finetune_mode(model, exp.finetune_mode)
 
     # L2SP anchor = starting point after init
-    anchor_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    anchor_state = {kk: vv.detach().cpu().clone() for kk, vv in model.state_dict().items()}
+
+    is_transfer_exp = (exp.init != "scratch")
 
     best = train_one(
         model, train_loader, val_loader, device,
         epochs=epochs, lr=exp.lr, wd=exp.wd, patience=patience,
-        l2sp_lam=exp.l2sp, anchor_state=anchor_state
+        l2sp_lam=exp.l2sp, anchor_state=anchor_state,
+        is_transfer=is_transfer_exp,
+
+        # ---- scoring strategies (T1/T2/T3) ----
+        backbone_lr_ratio=getattr(exp, "backbone_lr_ratio", 0.1),
+        loss_type=getattr(exp, "loss_type", "mse"),
+        huber_beta=getattr(exp, "huber_beta", 1.0),
+        hem_mode=getattr(exp, "hem_mode", "none"),
+        hem_clip=getattr(exp, "hem_clip", 3.0),
+        hem_tau=getattr(exp, "hem_tau", 1.0),
     )
 
     # save
-    exp_dir = os.path.join(out_dir_fam, "experiments", exp.name)
+    exp_dir = os.path.join(out_dir_fam, "experiments", exp.name, f"seed_{run_seed}")
     ensure_dir(exp_dir)
 
-    # [修改点]：画 Loss 曲线
-    history = best["history"]
+    # loss curve
+    history = best.get("history", {"train": [], "val": []})
     plt.figure()
-    plt.plot(history["train"], label="Train")
-    plt.plot(history["val"], label="Val")
-    plt.title(f"{fam} {exp.name} Loss")
+    plt.plot(history.get("train", []), label="Train")
+    plt.plot(history.get("val", []), label="Val")
+    plt.title(f"{fam} {exp.name} seed={run_seed} Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("MSE")
+    plt.ylabel("Loss")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(os.path.join(exp_dir, "loss_curve.png"))
     plt.close()
 
-    # [修改点]：确定最终评估集 (兼容 7:3 划分)
-    # 如果 Test 集基本没数据，而 Val 集有数据，就用 Val 做最终展示
+    # final eval set (7:3: test empty -> use val)
     use_val_as_test = (len(test_idx) <= 1 and len(val_idx) > 1)
     final_loader = val_loader if use_val_as_test else test_loader
+    eval_set = "val" if use_val_as_test else "test"
 
     pack = eval_pack(model, final_loader, device)
     met = metrics_1fam_display(pack, fam, y_mean_t, y_std_t, unit_scale=1000.0)
 
-    # [修改点]：画预测散点图 (Scatter)
+    # scatter
     if "yt" in met and "yp" in met and len(met["yt"]) > 0:
-        yt = met["yt"]
-        yp = met["yp"]
+        yt = np.asarray(met["yt"], dtype=float)
+        yp = np.asarray(met["yp"], dtype=float)
+
         plt.figure()
         plt.scatter(yt, yp, alpha=0.6, edgecolors='k', s=40)
-
-        # 画 y=x 参考线
-        all_vals = yt + yp
-        if len(all_vals) > 0:
-            vmin, vmax = min(all_vals), max(all_vals)
+        if len(yt) > 0:
+            vmin = float(min(np.min(yt), np.min(yp)))
+            vmax = float(max(np.max(yt), np.max(yp)))
             margin = (vmax - vmin) * 0.1
             vmin -= margin
             vmax += margin
@@ -799,15 +920,16 @@ def run_one_experiment_on_split_1fam(
 
         plt.xlabel(f"True {fam} (nm)")
         plt.ylabel(f"Pred {fam} (nm)")
-        plt.title(f"{fam} {exp.name} Scatter (R2={met['r2']:.3f})")
+        plt.title(f"{fam} {exp.name} seed={run_seed} (R2={met['r2']:.3f})")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(exp_dir, "scatter_best.png"))
         plt.close()
 
-    # 清理掉 raw points 以免 json 文件太大
-    if "yt" in met: del met["yt"]
-    if "yp" in met: del met["yp"]
+    # remove raw points for json compact
+    met_compact = dict(met)
+    if "yt" in met_compact: del met_compact["yt"]
+    if "yp" in met_compact: del met_compact["yp"]
 
     ckpt_path = os.path.join(exp_dir, "model_best.pth")
     torch.save({
@@ -815,6 +937,7 @@ def run_one_experiment_on_split_1fam(
         "best": best,
         "exp": exp.__dict__,
         "family": fam,
+        "run_seed": int(run_seed),
         "split": split,
         "norm": {
             "static_mean": s_mean, "static_std": s_std,
@@ -832,221 +955,120 @@ def run_one_experiment_on_split_1fam(
         }
     }, ckpt_path)
 
-    with open(os.path.join(exp_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
-        json.dump(met, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(exp_dir, "metrics_eval.json"), "w", encoding="utf-8") as f:
+        json.dump(met_compact, f, indent=2, ensure_ascii=False)
 
     row = {
         "family": fam,
         "exp": exp.name,
-        "r2": met["r2"],
-        "mae_nm": met["mae_nm"],
-        "n": met["n"],
-        "best_epoch": best["epoch"],
-        "val_loss": best["val_loss"],
-        "ckpt": ckpt_path
+        "r2": float(met["r2"]),
+        "mae_nm": float(met["mae_nm"]),
+        "n": int(met["n"]),
+        "best_epoch": int(best["epoch"]),
+        "val_loss": float(best["val_loss"]),
+        "ckpt": ckpt_path,
+
+        # ---- new fields for “same split, best-run over seeds” ----
+        "run_seed": int(run_seed),
+        "split_seed": int(split.get("seed", -1)) if isinstance(split, dict) else -1,
+        "trainN": int(len(train_idx)),
+        "valN": int(len(val_idx)),
+        "testN": int(len(test_idx)),
+        "eval_set": eval_set,
     }
+
     with open(os.path.join(exp_dir, "compare_row.json"), "w", encoding="utf-8") as f:
         json.dump(row, f, indent=2, ensure_ascii=False)
 
     return row
 
+def exp_to_group(exp_name: str) -> str:
+    """
+    你可以按自己的命名规则把 exp 映射到 0/1/2：
+      0: scratch
+      1: transfer
+      2: transfer+l2sp
+    """
+    n = str(exp_name).lower()
+    if "scratch" in n:
+        return "0_scratch"
+    if "l2sp" in n:
+        return "2_transfer_l2sp"
+    if "stageb" in n or "transfer" in n or "head_ln" in n or "bitfit" in n:
+        return "1_transfer"
+    return "other"
 
-def search_best_split_for_family(
-        fam: str,
+def get_common_valid_split(
         device: str,
         raw: Dict[str, Any],
         key_recipes: List[str],
-        trials: int,
+        families_eval: List[str],
         test_ratio: float,
         val_ratio: float,
-        seed0: int,
         min_test_points: int,
-        # 用哪个 exp 做 split-search 评估
-        search_exp: ExpCfg,
-        stageB_best_ckpt_for_fam: Optional[str],
-        model_type: str,
-        recipe_aug_mode: str,
-        out_dir_fam: str,
-        # 训练超参（search 可适当小一些）
-        search_epochs: int,
-        batch: int,
-        patience: int,
-        num_workers: int,
-        search_on: str = "test",  # "test" or "val"  (默认按 test 冲高)
-) -> Dict[str, Any]:
-    ensure_dir(os.path.join(out_dir_fam, "_search_tmp"))
+        seed_start: int,
+        max_trials: int = 1000
+) -> Dict[str, List[int]]:
+    print(f"\n>>> Searching for a COMMON split valid for families: {families_eval}")
+
     recipe_ids = raw["recipe_ids"]
-    mask = raw["mask"]
-    k = family_to_index(fam)
-    m_f = mask[:, k, :].astype(bool)  # (N,T)
-    scores = compute_quality_score_1fam(m_f)
+    mask = raw["mask"]  # (N, K, T)
 
-    trials_csv = os.path.join(out_dir_fam, "split_trials.csv")
-    with open(trials_csv, "w", encoding="utf-8") as f:
-        f.write("trial,trainN,valN,testN,test_valid_points,okMinPts,scoreTestMean\n")
+    # 预先计算每个 family 的 mask 索引
+    fam_indices = [family_to_index(f) for f in families_eval]
 
-    best = {"rank": -1e18, "trial": -1, "split": None, "note": ""}
-    err_cnt = 0
-    for tr in range(trials):
-        seed = int(seed0 * 100000 + tr)
+    # 我们用 mask 的总和作为 quality score (虽然不同 family 分数不同，这里用 sum 简化，或者只用 zmin)
+    # 这里使用 zmin (最稀缺资源) 的 mask 作为主要排序依据，确保它被均匀分配
+    # 或者简单点，使用所有 family mask 的 union
+    # 简单策略：随机尝试
+
+    # 构造一个虚拟的 score (这里不重要，主要靠随机打散)
+    N = len(recipe_ids)
+    scores = np.ones(N, dtype=np.int32)
+
+    for tr in range(max_trials):
+        seed = seed_start + tr
+        # 复用已有的 split 函数
         train_idx, val_idx, test_idx = split_with_key_and_quality(
             recipe_ids=recipe_ids,
             key_recipes=key_recipes,
-            scores=scores,
+            scores=scores,  # 这里的 score 影响不大，主要靠随机
             test_ratio=test_ratio,
             val_ratio=val_ratio,
             seed=seed
         )
 
-        # [修改点]：检查逻辑适配 Ratio=0
-        # 如果 test_ratio=0 (len(test_idx)很小)，则检查 val_idx 是否满足 min points
+        # 检查 validation/test set 是否满足所有 family 的最小点数要求
+        # 7:3 划分下，重点检查 val_idx (因为 test_ratio=0)
+        # 如果你有 test_ratio > 0，则检查 test_idx
         check_idx = test_idx if len(test_idx) > 1 else val_idx
-        ok_pts = check_min_test_points_1fam(m_f, check_idx, min_test_points)
 
-        test_valid = int(m_f[check_idx].sum())
-        score_test_mean = float(np.mean(scores[check_idx])) if len(check_idx) else 0.0
+        all_passed = True
+        details = []
 
-        with open(trials_csv, "a", encoding="utf-8") as f:
-            f.write(
-                f"{tr},{len(train_idx)},{len(val_idx)},{len(test_idx)},{test_valid},{int(ok_pts)},{score_test_mean:.4f}\n")
+        for k in fam_indices:
+            # 获取该 family 的 mask: (N, T)
+            m_f = mask[:, k, :].astype(bool)
+            # 计算 check_idx 里有多少个有效点
+            valid_pts = int(m_f[check_idx].sum())
+            details.append(valid_pts)
 
-        if not ok_pts:
-            continue
+            if valid_pts < min_test_points:
+                all_passed = False
+                break
 
-        split = dict(train_idx=train_idx.tolist(), val_idx=val_idx.tolist(), test_idx=test_idx.tolist())
-        try:
-            row = run_one_experiment_on_split_1fam(
-                fam=fam,
-                exp=search_exp,
-                device=device,
-                raw=raw,
-                split=split,
-                stageB_best_ckpt_for_fam=stageB_best_ckpt_for_fam,
-                model_type=model_type,
-                stageA_heads_root="",  # unused here
-                recipe_aug_mode=recipe_aug_mode,
-                out_dir_fam=os.path.join(out_dir_fam, "_search_tmp"),
-                epochs=search_epochs,
-                batch=batch,
-                patience=patience,
-                num_workers=num_workers,
-            )
-            # R2 自动取自 Val 或 Test (取决于 run_one_exp 里的逻辑)
-            rank = float(row["r2"]) if np.isfinite(row["r2"]) else -1e9
-        except Exception as e:
-            err_cnt += 1
-            if err_cnt <= 5:
-                msg = traceback.format_exc()
-                print(f"[SPLIT-SEARCH][{fam}] trial={tr} FAILED:\n{msg}")
-                with open(os.path.join(out_dir_fam, "split_search_errors.log"), "a", encoding="utf-8") as ff:
-                    ff.write(f"\n=== trial {tr} ===\n{msg}\n")
-            continue
+        if all_passed:
+            print(f"   [Success] Found common split at trial {tr} (Seed {seed})")
+            print(f"   [Stats] Valid points in eval set per family: {dict(zip(families_eval, details))}")
+            return {
+                "train_idx": train_idx.tolist(),
+                "val_idx": val_idx.tolist(),
+                "test_idx": test_idx.tolist(),
+                "seed": seed
+            }
 
-        if rank > best["rank"]:
-            best.update(rank=rank, trial=tr, split=split,
-                        note=f"fam={fam} search_exp={search_exp.name} rank({search_on})={rank:.6f}")
-            with open(os.path.join(out_dir_fam, "best_split.json"), "w", encoding="utf-8") as f:
-                json.dump(best, f, indent=2, ensure_ascii=False)
-
-    if best["split"] is None:
-        raise RuntimeError(f"[{fam}] No valid split found. Try reduce min_test_points or increase trials.")
-
-    return best
-def search_best_split_for_family(
-    fam: str,
-    device: str,
-    raw: Dict[str, Any],
-    key_recipes: List[str],
-    trials: int,
-    test_ratio: float,
-    val_ratio: float,
-    seed0: int,
-    min_test_points: int,
-    # 用哪个 exp 做 split-search 评估
-    search_exp: ExpCfg,
-    stageB_best_ckpt_for_fam: Optional[str],
-    model_type: str,
-    recipe_aug_mode: str,
-    out_dir_fam: str,
-    # 训练超参（search 可适当小一些）
-    search_epochs: int,
-    batch: int,
-    patience: int,
-    num_workers: int,
-    search_on: str = "test",  # "test" or "val"  (默认按 test 冲高)
-) -> Dict[str, Any]:
-    ensure_dir(os.path.join(out_dir_fam, "_search_tmp"))
-    recipe_ids = raw["recipe_ids"]
-    mask = raw["mask"]
-    k = family_to_index(fam)
-    m_f = mask[:, k, :].astype(bool)  # (N,T)
-    scores = compute_quality_score_1fam(m_f)
-
-    trials_csv = os.path.join(out_dir_fam, "split_trials.csv")
-    with open(trials_csv, "w", encoding="utf-8") as f:
-        f.write("trial,trainN,valN,testN,test_valid_points,okMinPts,scoreTestMean\n")
-
-    best = {"rank": -1e18, "trial": -1, "split": None, "note": ""}
-    err_cnt = 0
-    for tr in range(trials):
-        seed = int(seed0 * 100000 + tr)
-        train_idx, val_idx, test_idx = split_with_key_and_quality(
-            recipe_ids=recipe_ids,
-            key_recipes=key_recipes,
-            scores=scores,
-            test_ratio=test_ratio,
-            val_ratio=val_ratio,
-            seed=seed
-        )
-        ok_pts = check_min_test_points_1fam(m_f, test_idx, min_test_points)
-        test_valid = int(m_f[test_idx].sum())
-        score_test_mean = float(np.mean(scores[test_idx])) if len(test_idx) else 0.0
-
-        with open(trials_csv, "a", encoding="utf-8") as f:
-            f.write(f"{tr},{len(train_idx)},{len(val_idx)},{len(test_idx)},{test_valid},{int(ok_pts)},{score_test_mean:.4f}\n")
-
-        if not ok_pts:
-            continue
-
-        split = dict(train_idx=train_idx.tolist(), val_idx=val_idx.tolist(), test_idx=test_idx.tolist())
-        try:
-            row = run_one_experiment_on_split_1fam(
-                fam=fam,
-                exp=search_exp,
-                device=device,
-                raw=raw,
-                split=split,
-                stageB_best_ckpt_for_fam=stageB_best_ckpt_for_fam,
-                model_type=model_type,
-                stageA_heads_root="",            # unused here
-                recipe_aug_mode=recipe_aug_mode,
-                out_dir_fam=os.path.join(out_dir_fam, "_search_tmp"),
-                epochs=search_epochs,
-                batch=batch,
-                patience=patience,
-                num_workers=num_workers,
-            )
-            rank = float(row["r2"]) if np.isfinite(row["r2"]) else -1e9
-        except Exception as e:
-            err_cnt += 1
-            if err_cnt <= 5:
-                msg = traceback.format_exc()
-                print(f"[SPLIT-SEARCH][{fam}] trial={tr} FAILED:\n{msg}")
-                with open(os.path.join(out_dir_fam, "split_search_errors.log"), "a", encoding="utf-8") as ff:
-                    ff.write(f"\n=== trial {tr} ===\n{msg}\n")
-            continue
-
-        if rank > best["rank"]:
-            best.update(rank=rank, trial=tr, split=split,
-                        note=f"fam={fam} search_exp={search_exp.name} rank({search_on})={rank:.6f}")
-            with open(os.path.join(out_dir_fam, "best_split.json"), "w", encoding="utf-8") as f:
-                json.dump(best, f, indent=2, ensure_ascii=False)
-
-    if best["split"] is None:
-        raise RuntimeError(f"[{fam}] No valid split found. Try reduce min_test_points or increase trials.")
-
-    return best
-
+    raise RuntimeError(f"Could not find a common split after {max_trials} trials. "
+                       f"Try reducing min_test_points or families list.")
 
 # =========================================================
 #  新增：数据健康度与分布漂移检测工具 (Stage C 专用版)
@@ -1199,6 +1221,26 @@ def diagnose_distribution_shift(raw, stageB_runs_root):
     else:
         print("\n [CONCLUSION] Distribution seems matched.")
 
+def pick_best_rows(rows: List[Dict[str, Any]],
+                   key_fields: Tuple[str, ...] = ("family", "exp"),
+                   metric: str = "r2") -> List[Dict[str, Any]]:
+    """
+    在同一 split 下（你已经固定 common_split），对多次运行（不同seed）取 best-run。
+    默认：每个 (family, exp) 取 r2 最大的那条记录。
+    """
+    best = {}
+    for r in rows:
+        key = tuple(r.get(k) for k in key_fields)
+        cur = best.get(key, None)
+        if cur is None:
+            best[key] = r
+            continue
+        try:
+            if float(r.get(metric, -1e9)) > float(cur.get(metric, -1e9)):
+                best[key] = r
+        except Exception:
+            pass
+    return list(best.values())
 
 def metrics_1fam_display(pack: Dict[str, np.ndarray],
                          fam: str,
@@ -1251,14 +1293,12 @@ def metrics_1fam_display(pack: Dict[str, np.ndarray],
     return {"family": fam, "r2": r2, "mae_nm": mae, "n": n,
             "yp": yp.tolist(), "yt": yt.tolist()}
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--new_excel", type=str, default=r"D:\PycharmProjects\Bosch\Bosch.xlsx")
     ap.add_argument("--out_dir", type=str, default=r"D:\PycharmProjects\Bosch\runs_stageC_singlehead")
     ap.add_argument("--stageB_runs_root", type=str, default=r"D:\PycharmProjects\Bosch\runs_stageB_morph_phys7")
 
-    # 注意：这里的 model_type 默认值会被 StageB 的 best config 覆盖
     ap.add_argument("--model_type", type=str, default="transformer", choices=["transformer", "gru", "mlp"])
     ap.add_argument("--recipe_aug_mode", type=str, default="base")
     ap.add_argument("--height_family", type=str, default="h1")
@@ -1268,39 +1308,32 @@ def main():
     ap.add_argument("--families_eval", type=str, default="zmin,h1,d1,w")
 
     ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--seed_repeats", type=int, default=10)  # [新增] 同一 split 下扫 seed 的次数
     ap.add_argument("--trials", type=int, default=500)
 
-    # [修改点]：默认 7:3 划分 (Test=0, Val=0.3)
-    # Val 用于选择 Best Epoch，同时也用于最终汇报 (Test Best策略)
     ap.add_argument("--test_ratio", type=float, default=0.0)
     ap.add_argument("--val_ratio", type=float, default=0.3)
-    ap.add_argument("--min_test_points", type=int, default=2)
+    ap.add_argument("--min_test_points", type=int, default=1)
 
     ap.add_argument("--epochs", type=int, default=400)
-    ap.add_argument("--search_epochs", type=int, default=200)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--patience", type=int, default=50)
     ap.add_argument("--num_workers", type=int, default=0)
+
     args = ap.parse_args()
 
     ensure_dir(args.out_dir)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    set_seed(args.seed)
 
     # ---------------------------------------------------------
-    # 1) 加载 StageB 最佳配置 & 关键修复：对齐模型结构参数
+    # 1) 加载 StageB 最佳配置 & 对齐模型结构参数
     # ---------------------------------------------------------
     print(f"[StageC] Loading best config from: {args.stageB_runs_root}")
-    # 修复点：su 现在有了 load_best_config_common
     best_conf = su.load_best_config_common(args.stageB_runs_root)
-
-    # ✅ 修复点：调用 StageB 的函数，将 best_conf 里的 d_model/layers 等覆盖到 Cfg
-    # 否则 StageC 建立的模型是默认大小，加载权重时会报错 size mismatch
     sb.apply_hp_from_best_conf_to_cfg(best_conf)
 
-    # 获取 StageB 决定的关键模式
     stageB_aug_mode = best_conf.get("recipe_aug_mode", args.recipe_aug_mode)
-    stageB_phys_mode = best_conf.get("phys7_mode", "full")  # 获取 StageB 用的 phys7 模式
+    stageB_phys_mode = best_conf.get("phys7_mode", "full")
     stageB_model_type = best_conf.get("model_type", args.model_type)
 
     print(f"[StageC] Aligning with StageB:")
@@ -1309,11 +1342,9 @@ def main():
     print(f"  - Phys Mode:  {stageB_phys_mode}")
     print(f"  - HPs: d_model={sb.Cfg.tf_d_model}, layers={sb.Cfg.tf_layers}")
 
-    # 覆盖参数
     args.recipe_aug_mode = stageB_aug_mode
     args.model_type = stageB_model_type
 
-    # 解析 Checkpoints
     stageB_best = resolve_stageB_best_ckpts_from_common(args.stageB_runs_root)
 
     # ---------------------------------------------------------
@@ -1328,6 +1359,7 @@ def main():
     )
     diagnose_data_health(raw)
     diagnose_distribution_shift(raw, args.stageB_runs_root)
+
     families_eval = [x.strip().lower() for x in str(args.families_eval).split(",") if x.strip()]
     families_eval = [f for f in families_eval if f in [x.lower() for x in FAMILIES]]
     if not families_eval:
@@ -1336,50 +1368,145 @@ def main():
     key_recipes = [x.strip() for x in str(args.key_recipes).split(",") if x.strip()]
 
     # ---------------------------------------------------------
-    # 3) 定义实验矩阵 (动态对齐 Phys7 Mode)
+    # 3) 固定一个统一 split（所有 family/exp 共用）
     # ---------------------------------------------------------
-    # 修复点：这里的 phys7_mode 必须和 StageB 一致，
-    # 否则如果 StageB 是 only_energy (3维)，这里 full (7维) 就会导致输入特征错位或多余。
+    print("=" * 60)
+    print(" [Step 1] Finding a Common Split for ALL families")
+    print("=" * 60)
+
+    common_split = get_common_valid_split(
+        device=device,
+        raw=raw,
+        key_recipes=key_recipes,
+        families_eval=families_eval,
+        test_ratio=args.test_ratio,
+        val_ratio=args.val_ratio,
+        min_test_points=args.min_test_points,
+        seed_start=args.seed
+    )
+
+    with open(os.path.join(args.out_dir, "common_best_split.json"), "w", encoding="utf-8") as f:
+        json.dump(common_split, f, indent=2)
+
+    # ---------------------------------------------------------
+    # 4) 实验列表（不变）
+    # ---------------------------------------------------------
     pm = stageB_phys_mode
 
-    experiments = [
-        # 基线：不加载权重，从头练
-        ExpCfg(name="scratch_full", init="scratch", finetune_mode="full", phys7_mode=pm, lr=3e-4, wd=1e-4, l2sp=0.0),
+    # -------------------------
+    # Baseline（保留你原来的）
+    # -------------------------
+    experiments: List[ExpCfg] = [
+        ExpCfg(name="scratch_full", init="scratch", finetune_mode="full", phys7_mode=pm,
+               lr=3e-4, wd=1e-4, l2sp=0.0,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=1.0),
 
-        # 迁移：全参数微调
-        ExpCfg(name="stageB_full", init="stageB_best", finetune_mode="full", phys7_mode=pm, lr=2e-4, wd=1e-4, l2sp=0.0),
+        ExpCfg(name="stageB_full", init="stageB_best", finetune_mode="full", phys7_mode=pm,
+               lr=2e-4, wd=1e-4, l2sp=0.0,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=0.1),
 
-        # 迁移：只修 Head + LayerNorm (推荐)
-        ExpCfg(name="stageB_head_ln", init="stageB_best", finetune_mode="head_ln", phys7_mode=pm, lr=6e-4, wd=1e-4,
-               l2sp=0.0),
+        ExpCfg(name="stageB_head_ln", init="stageB_best", finetune_mode="head_ln", phys7_mode=pm,
+               lr=6e-4, wd=1e-4, l2sp=0.0,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=0.1),
 
-        # 迁移：BitFit (只修 Bias)
-        ExpCfg(name="stageB_bitfit_ln", init="stageB_best", finetune_mode="bitfit_ln", phys7_mode=pm, lr=1e-3, wd=0.0,
-               l2sp=0.0),
+        ExpCfg(name="stageB_bitfit_ln", init="stageB_best", finetune_mode="bitfit_ln", phys7_mode=pm,
+               lr=1e-3, wd=0.0, l2sp=0.0,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=0.1),
 
-        # 迁移：L2SP 正则
-        ExpCfg(name="stageB_head_ln_l2sp", init="stageB_best", finetune_mode="head_ln", phys7_mode=pm, lr=6e-4, wd=1e-4,
-               l2sp=1e-3),
+        ExpCfg(name="stageB_head_ln_l2sp", init="stageB_best", finetune_mode="head_ln", phys7_mode=pm,
+               lr=6e-4, wd=1e-4, l2sp=1e-3,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=0.1),
 
-        # 消融：强制不用物理信息 (对比看 Phys7 是否真的有帮助)
-        ExpCfg(name="stageB_head_ln_noP7", init="stageB_best", finetune_mode="head_ln", phys7_mode="none", lr=6e-4,
-               wd=1e-4, l2sp=0.0),
+        ExpCfg(name="stageB_head_ln_noP7", init="stageB_best", finetune_mode="head_ln", phys7_mode="none",
+               lr=6e-4, wd=1e-4, l2sp=0.0,
+               loss_type="mse", hem_mode="none", backbone_lr_ratio=0.1),
     ]
 
-    # Split-search 用的策略
-    search_exp = next(e for e in experiments if e.name == "stageB_head_ln")
+    # -------------------------
+    # 提分策略 T1/T2/T3 sweep（一次性加进去）
+    # 只对 transfer 组做（scratch 没必要扫 backbone_lr_ratio）
+    # -------------------------
+    finetune_modes = ["full", "head_ln"]  # 够用了，bitfit 留作 baseline
+    lr_base = 2e-4  # 与你 stageB_full 接近
+    wd_base = 1e-4
 
-    summary_path = os.path.join(args.out_dir, "summary_all_families.csv")
-    if not os.path.exists(summary_path):
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("family,exp,r2,mae_nm,n,best_epoch,val_loss,ckpt\n")
+    # T1: huber + hem none + backbone ratio sweep + l2sp=0
+    for ft in finetune_modes:
+        for ratio in [0.05, 0.1]:
+            experiments.append(
+                ExpCfg(
+                    name=f"T1_huber_none_{ft}_r{ratio}",
+                    init="stageB_best",
+                    finetune_mode=ft,
+                    phys7_mode=pm,
+                    lr=lr_base if ft == "full" else 6e-4,
+                    wd=wd_base,
+                    l2sp=0.0,
+                    loss_type="huber",
+                    huber_beta=1.0,
+                    hem_mode="none",
+                    backbone_lr_ratio=ratio
+                )
+            )
 
-    all_rows = []
+    # T2: T1 + L2SP sweep
+    for ft in finetune_modes:
+        for ratio in [0.05, 0.1]:
+            for l2 in [3e-4, 1e-3]:
+                experiments.append(
+                    ExpCfg(
+                        name=f"T2_huber_none_{ft}_r{ratio}_l2{l2}",
+                        init="stageB_best",
+                        finetune_mode=ft,
+                        phys7_mode=pm,
+                        lr=lr_base if ft == "full" else 6e-4,
+                        wd=wd_base,
+                        l2sp=float(l2),
+                        loss_type="huber",
+                        huber_beta=1.0,
+                        hem_mode="none",
+                        backbone_lr_ratio=ratio
+                    )
+                )
 
+    # T3: 如果你坚持 HEM：clamp + tau=2 + clip=3
+    for ft in finetune_modes:
+        experiments.append(
+            ExpCfg(
+                name=f"T3_huber_clamp_{ft}_r0.05",
+                init="stageB_best",
+                finetune_mode=ft,
+                phys7_mode=pm,
+                lr=lr_base if ft == "full" else 6e-4,
+                wd=wd_base,
+                l2sp=0.0,
+                loss_type="huber",
+                huber_beta=1.0,
+                hem_mode="clamp",
+                hem_clip=3.0,
+                hem_tau=2.0,
+                backbone_lr_ratio=0.05
+            )
+        )
     # ---------------------------------------------------------
-    # 4) 执行实验
+    # 5) 同一 split 下扫 seed，收集 all-runs & best-runs
     # ---------------------------------------------------------
+    summary_all = os.path.join(args.out_dir, "summary_common_split_allruns.csv")
+    summary_best = os.path.join(args.out_dir, "summary_common_split_best.csv")
+
+    header = "family,exp,r2,mae_nm,n,best_epoch,val_loss,run_seed,split_seed,trainN,valN,testN,eval_set,ckpt\n"
+    if not os.path.exists(summary_all):
+        with open(summary_all, "w", encoding="utf-8") as f:
+            f.write(header)
+    if not os.path.exists(summary_best):
+        with open(summary_best, "w", encoding="utf-8") as f:
+            f.write(header)
+
+    all_rows: List[Dict[str, Any]] = []
+
     for fam in families_eval:
+        print(f"\n>>> Processing Family: [{fam}] on Common Split")
+
         out_dir_fam = os.path.join(args.out_dir, fam)
         ensure_dir(out_dir_fam)
 
@@ -1391,46 +1518,44 @@ def main():
             print(f"[WARN] Skip {fam}: StageB best ckpt missing.")
             continue
 
-        # Split Search
-        print(f"\n>>> Searching best split for [{fam}] ...")
-        best = search_best_split_for_family(
-            fam=fam, device=device, raw=raw, key_recipes=key_recipes,
-            trials=args.trials, test_ratio=args.test_ratio, val_ratio=args.val_ratio,
-            seed0=args.seed, min_test_points=args.min_test_points,
-            search_exp=search_exp, stageB_best_ckpt_for_fam=fam_ckpt,
-            model_type=args.model_type, recipe_aug_mode=args.recipe_aug_mode,
-            out_dir_fam=out_dir_fam, search_epochs=args.search_epochs,
-            batch=args.batch, patience=max(10, args.patience // 2), num_workers=args.num_workers
-        )
-        best_split = best["split"]
-
-        # Run Experiments
-        comp_csv = os.path.join(out_dir_fam, "compare_on_best_split.csv")
-        if not os.path.exists(comp_csv):
-            with open(comp_csv, "w", encoding="utf-8") as f:
-                f.write("family,exp,r2,mae_nm,n,best_epoch,val_loss,ckpt\n")
-
-        print(f">>> Running experiments on best split for [{fam}] ...")
         for exp in experiments:
-            print(f"   -> {exp.name}")
-            row = run_one_experiment_on_split_1fam(
-                fam=fam, exp=exp, device=device, raw=raw, split=best_split,
-                stageB_best_ckpt_for_fam=fam_ckpt, model_type=args.model_type,
-                stageA_heads_root=args.stageA_heads_root, recipe_aug_mode=args.recipe_aug_mode,
-                out_dir_fam=out_dir_fam, epochs=args.epochs, batch=args.batch,
-                patience=args.patience, num_workers=args.num_workers
-            )
-            all_rows.append(row)
-            with open(comp_csv, "a", encoding="utf-8") as f:
-                f.write(
-                    f"{row['family']},{row['exp']},{row['r2']},{row['mae_nm']},{row['n']},{row['best_epoch']},{row['val_loss']},{row['ckpt']}\n")
-            with open(summary_path, "a", encoding="utf-8") as f:
-                f.write(
-                    f"{row['family']},{row['exp']},{row['r2']},{row['mae_nm']},{row['n']},{row['best_epoch']},{row['val_loss']},{row['ckpt']}\n")
+            print(f"   -> {exp.name} (seed sweep x{args.seed_repeats})")
 
-    with open(os.path.join(args.out_dir, "summary_all_families.json"), "w", encoding="utf-8") as f:
-        json.dump(all_rows, f, indent=2, ensure_ascii=False)
+            for i in range(int(args.seed_repeats)):
+                run_seed = int(args.seed + i)
 
-    print("\n[DONE] StageC Finished.")
+                row = run_one_experiment_on_split_1fam(
+                    fam=fam, exp=exp, device=device, raw=raw,
+                    split=common_split,
+                    stageB_best_ckpt_for_fam=fam_ckpt,
+                    model_type=args.model_type,
+                    stageA_heads_root=args.stageA_heads_root,
+                    recipe_aug_mode=args.recipe_aug_mode,
+                    out_dir_fam=out_dir_fam,
+                    epochs=args.epochs,
+                    batch=args.batch,
+                    patience=args.patience,
+                    num_workers=args.num_workers,
+                    run_seed=run_seed,
+                )
+                all_rows.append(row)
+
+                with open(summary_all, "a", encoding="utf-8") as f:
+                    f.write(f"{row['family']},{row['exp']},{row['r2']},{row['mae_nm']},{row['n']},"
+                            f"{row['best_epoch']},{row['val_loss']},{row['run_seed']},{row['split_seed']},"
+                            f"{row['trainN']},{row['valN']},{row['testN']},{row['eval_set']},{row['ckpt']}\n")
+
+    # 选 best-run（同一 split 内：每个 family+exp 取 r2 最大）
+    best_rows = pick_best_rows(all_rows, key_fields=("family", "exp"), metric="r2")
+    best_rows = sorted(best_rows, key=lambda r: (r["family"], r["exp"]))
+
+    with open(summary_best, "a", encoding="utf-8") as f:
+        for row in best_rows:
+            f.write(f"{row['family']},{row['exp']},{row['r2']},{row['mae_nm']},{row['n']},"
+                    f"{row['best_epoch']},{row['val_loss']},{row['run_seed']},{row['split_seed']},"
+                    f"{row['trainN']},{row['valN']},{row['testN']},{row['eval_set']},{row['ckpt']}\n")
+
+    print("\n[DONE] StageC Finished: SAME split, best-run picked over seeds.")
+
 if __name__ == "__main__":
     main()
