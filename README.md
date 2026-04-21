@@ -2,6 +2,12 @@
 
 A physics-informed learning framework for Bosch DRIE morphology prediction and few-shot transfer.
 
+pycharm版本 
+
+数据集位置
+
+
+
 ## Overview
 
 This repository implements a staged learning pipeline for Bosch deep reactive ion etching (DRIE), with a focus on bridging **process recipes**, **IEDF-derived physical descriptors**, and **cycle-resolved morphology prediction**.
@@ -16,25 +22,6 @@ Instead of directly fitting etched morphology from recipe parameters alone, the 
 The codebase is mainly organized around Bosch TSV / trench etch cases stored in Excel sheets and per-case IEDF CSV files.
 
 ## Pipeline
-
-### 1. IEDF-derived physical representation
-
-`extract_phys7_from_iedf.py` parses simulated IEDF files and converts them into a compact 7-dimensional physical descriptor vector (`Phys7`). The current implementation uses dominant ions from:
-
-* `SF6 / sheath2`: `F_1p`, `SF3_1p`, `SF4_1p`, `SF5_1p`
-* `C4F8 / sheath1`: `CF3_1p`, `C2F3_1p`
-
-The extracted features are:
-
-* `logGamma_SF6_tot`
-* `pF_SF6`
-* `spread_SF6`
-* `qskew_SF6`
-* `logGamma_C4F8_tot`
-* `rho_C4F8`
-* `spread_C4F8`
-
-The script can also generate IEDF + CDF visualization figures for selected cases.
 
 ### 2. Stage A: recipe → Phys7
 
