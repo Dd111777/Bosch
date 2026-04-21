@@ -86,5 +86,3 @@ Bosch/
 └── run_all_experiments.py
 ```
 
-
-如果你想，我可以下一条直接给你一版**更适合 GitHub 首页展示的精简版 README**。
